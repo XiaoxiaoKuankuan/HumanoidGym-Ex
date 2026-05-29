@@ -30,14 +30,21 @@
 # Copyright (c) 2024 Beijing RobotEra TECHNOLOGY CO.,LTD. All rights reserved.
 
 import os
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import cv2
 import numpy as np
 from isaacgym import gymapi
 from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
 
 # import isaacgym
-from humanoid_gym_ex.envs import *
-from humanoid_gym_ex.utils import  get_args, export_policy_as_jit, task_registry, Logger
+import humanoid_gym_ex.envs as envs_module
+from humanoid_gym_ex.utils import  get_args, export_policy_as_jit, Logger
 from isaacgym.torch_utils import *
 
 import torch
@@ -80,6 +87,7 @@ def _translate_follow_camera(env, root, state):
 
 
 def play(args):
+    task_registry = envs_module.register_tasks()
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # override some parameters for testing
     env_cfg.env.num_envs = min(env_cfg.env.num_envs, 1)
@@ -163,7 +171,12 @@ def play(args):
             env.commands[:, 2] = 0.
             env.commands[:, 3] = 0.
 
-        obs, critic_obs, rews, dones, infos = env.step(actions.detach())
+        step_result = env.step(actions.detach())
+        if len(step_result) == 6:
+            obs, critic_obs, rews, dones, infos, aux = step_result
+            infos["aux"] = aux
+        else:
+            obs, critic_obs, rews, dones, infos = step_result
         if FOLLOW_CAMERA and env.viewer is not None and i % 5 == 0:
             root = env.root_states[robot_index, :3].detach().cpu().numpy()
             _translate_follow_camera(env, root, follow_camera_state)

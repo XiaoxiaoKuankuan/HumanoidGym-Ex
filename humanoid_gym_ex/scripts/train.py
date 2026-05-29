@@ -29,11 +29,18 @@
 #
 # Copyright (c) 2024 Beijing RobotEra TECHNOLOGY CO.,LTD. All rights reserved.
 
+import sys
+from pathlib import Path
 
-from humanoid_gym_ex.envs import *
-from humanoid_gym_ex.utils import get_args, task_registry
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+import humanoid_gym_ex.envs as envs_module
+from humanoid_gym_ex.utils import get_args
 
 def train(args):
+    task_registry = envs_module.register_tasks()
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
     ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)

@@ -52,6 +52,7 @@ class PPO:
                  use_clipped_value_loss=True,
                  schedule="fixed",
                  desired_kl=0.01,
+                 aux_loss_coef=0.01,
                  device='cpu',
                  ):
 
@@ -74,13 +75,30 @@ class PPO:
         self.num_mini_batches = num_mini_batches
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
+        self.aux_loss_coef = aux_loss_coef
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
 
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
-        self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device)
+    def init_storage(
+        self,
+        num_envs,
+        num_transitions_per_env,
+        actor_obs_shape,
+        critic_obs_shape,
+        action_shape,
+        aux_shape=None,
+    ):
+        self.storage = RolloutStorage(
+            num_envs,
+            num_transitions_per_env,
+            actor_obs_shape,
+            critic_obs_shape,
+            action_shape,
+            aux_shape,
+            self.device,
+        )
 
     def test_mode(self):
         self.actor_critic.test()
@@ -100,11 +118,15 @@ class PPO:
         self.transition.critic_observations = critic_obs
         return self.transition.actions
     
-    def process_env_step(self, rewards, dones, infos):
+    def process_env_step(self, rewards, dones, infos, aux=None):
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        if aux is None and infos is not None:
+            aux = infos.get("aux")
+        if aux is not None:
+            self.transition.aux = aux.to(self.device)
         # Bootstrapping on time outs
-        if 'time_outs' in infos:
+        if infos is not None and 'time_outs' in infos:
             self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
 
         # Record the transition
@@ -119,10 +141,11 @@ class PPO:
     def update(self):
         mean_value_loss = 0
         mean_surrogate_loss = 0
+        mean_aux_loss = 0
 
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
-            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
+            old_mu_batch, old_sigma_batch, aux_batch, hid_states_batch, masks_batch in generator:
 
 
                 self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
@@ -131,6 +154,12 @@ class PPO:
                 mu_batch = self.actor_critic.action_mean
                 sigma_batch = self.actor_critic.action_std
                 entropy_batch = self.actor_critic.entropy
+                aux_loss = torch.zeros((), device=self.device)
+                if aux_batch is not None and self.aux_loss_coef > 0.0:
+                    aux_batch_pred = self.actor_critic.get_aux(obs_batch)
+                    if aux_batch_pred is None:
+                        raise RuntimeError("RolloutStorage has aux targets, but ActorCritic has no aux head")
+                    aux_loss = (aux_batch - aux_batch_pred).pow(2).mean()
 
                 # KL
                 if self.desired_kl != None and self.schedule == 'adaptive':
@@ -165,7 +194,12 @@ class PPO:
                 else:
                     value_loss = (returns_batch - value_batch).pow(2).mean()
 
-                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+                loss = (
+                    surrogate_loss
+                    + self.value_loss_coef * value_loss
+                    - self.entropy_coef * entropy_batch.mean()
+                    + self.aux_loss_coef * aux_loss
+                )
 
                 # Gradient step
                 self.optimizer.zero_grad()
@@ -175,10 +209,13 @@ class PPO:
 
                 mean_value_loss += value_loss.item()
                 mean_surrogate_loss += surrogate_loss.item()
+                mean_aux_loss += aux_loss.item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
+        mean_aux_loss /= num_updates
+        self.last_mean_aux_loss = mean_aux_loss
         self.storage.clear()
 
-        return mean_value_loss, mean_surrogate_loss
+        return mean_value_loss, mean_surrogate_loss, mean_aux_loss

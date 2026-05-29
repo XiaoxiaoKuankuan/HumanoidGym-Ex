@@ -167,6 +167,10 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
                 env_cfg.env.num_privileged_obs = env_cfg.env.single_num_privileged_obs * env_cfg.env.c_frame_stack
         if hasattr(args, "terrain_curriculum") and args.terrain_curriculum:
             env_cfg.terrain.curriculum = True
+        if hasattr(args, "reference_model") and args.reference_model is not None and hasattr(env_cfg, "motion"):
+            env_cfg.motion.reference_model_path = args.reference_model
+        if hasattr(args, "fixed_bpm") and args.fixed_bpm is not None and hasattr(env_cfg, "motion"):
+            env_cfg.motion.fixed_bpm = args.fixed_bpm
     if cfg_train is not None:
         if args.seed is not None:
             cfg_train.seed = args.seed
@@ -270,6 +274,16 @@ def get_args():
             "action": "store_true",
             "default": False,
             "help": "Enable terrain curriculum.",
+        },
+        {
+            "name": "--reference_model",
+            "type": str,
+            "help": "Path to BPM reference state checkpoint. Overrides cfg.motion.reference_model_path when the task has a motion config.",
+        },
+        {
+            "name": "--fixed_bpm",
+            "type": float,
+            "help": "Use a fixed BPM command for BPM mimic tasks. Overrides cfg.motion.fixed_bpm.",
         },
     ]
     # parse arguments

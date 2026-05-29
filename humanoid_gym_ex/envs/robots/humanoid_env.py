@@ -34,7 +34,7 @@ from isaacgym.torch_utils import *
 from isaacgym import gymtorch, gymapi
 
 import torch
-from humanoid_gym_ex.envs import LeggedRobot
+from humanoid_gym_ex.envs.base.legged_robot import LeggedRobot
 
 from humanoid_gym_ex.utils.terrain import  HumanoidTerrain
 

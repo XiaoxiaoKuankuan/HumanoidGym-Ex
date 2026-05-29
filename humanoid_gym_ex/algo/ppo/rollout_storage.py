@@ -45,11 +45,21 @@ class RolloutStorage:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
+            self.aux = None
         
         def clear(self):
             self.__init__()
 
-    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, device='cpu'):
+    def __init__(
+        self,
+        num_envs,
+        num_transitions_per_env,
+        obs_shape,
+        privileged_obs_shape,
+        actions_shape,
+        aux_shape=None,
+        device='cpu',
+    ):
 
         self.device = device
 
@@ -66,6 +76,10 @@ class RolloutStorage:
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        if aux_shape is not None and aux_shape[0] is not None and int(aux_shape[0]) > 0:
+            self.aux = torch.zeros(num_transitions_per_env, num_envs, *aux_shape, device=self.device)
+        else:
+            self.aux = None
 
         # For PPO
         self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
@@ -92,6 +106,10 @@ class RolloutStorage:
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        if self.aux is not None:
+            if transition.aux is None:
+                raise ValueError("RolloutStorage expected aux targets, but transition.aux is None")
+            self.aux[self.step].copy_(transition.aux)
         self.values[self.step].copy_(transition.values)
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
@@ -161,6 +179,7 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
+        aux = self.aux.flatten(0, 1) if self.aux is not None else None
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -178,5 +197,6 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
+                aux_batch = aux[batch_idx] if aux is not None else None
                 yield obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
-                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None
+                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, aux_batch, (None, None), None

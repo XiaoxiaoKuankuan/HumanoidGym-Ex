@@ -1,0 +1,2203 @@
+from __future__ import annotations
+
+import math
+import os
+import time
+from types import SimpleNamespace
+
+import torch
+
+import isaaclab.sim as sim_utils
+from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.assets import Articulation, ArticulationCfg
+from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
+from isaaclab.sim import PhysxCfg, SimulationCfg
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils import configclass
+
+from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
+from humanoid_gym_ex.envs.backends.isaaclab_backend import IsaacLabBackend
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config_lab import MrobotMimicLabCfg as MrobotMimicCfg
+from humanoid_gym_ex.utils.reference_state import JOINT_NAME_ALIASES, ReferenceStateNet
+
+
+def _quat_wxyz_to_xyzw(quat):
+    return torch.cat((quat[..., 1:4], quat[..., 0:1]), dim=-1)
+
+
+def _quat_xyzw_to_wxyz(quat):
+    return torch.cat((quat[..., 3:4], quat[..., 0:3]), dim=-1)
+
+
+def _quat_wxyz_to_euler_xyz(quat):
+    w, x, y, z = quat.unbind(-1)
+    roll = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = torch.asin(torch.clamp(2.0 * (w * y - z * x), -1.0, 1.0))
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return torch.stack((roll, pitch, yaw), dim=-1)
+
+
+def _quat_rotate_inverse_wxyz(quat, vec):
+    w = quat[:, 0]
+    q_vec = quat[:, 1:4]
+    a = vec * (2.0 * w * w - 1.0).unsqueeze(-1)
+    b = torch.cross(q_vec, vec, dim=-1) * (-2.0 * w).unsqueeze(-1)
+    c = q_vec * (2.0 * torch.sum(q_vec * vec, dim=-1, keepdim=True))
+    return a + b + c
+
+
+def _quat_apply_wxyz(quat, vec):
+    w = quat[..., 0:1]
+    q_vec = quat[..., 1:4]
+    a = vec * (2.0 * w * w - 1.0)
+    b = torch.cross(q_vec, vec, dim=-1) * (2.0 * w)
+    c = q_vec * (2.0 * torch.sum(q_vec * vec, dim=-1, keepdim=True))
+    return a + b + c
+
+
+def _quat_conjugate_wxyz(quat):
+    result = quat.clone()
+    result[..., 1:4] = -result[..., 1:4]
+    return result
+
+
+def _quat_inv_wxyz(quat):
+    return _quat_conjugate_wxyz(quat) / torch.sum(quat * quat, dim=-1, keepdim=True).clamp(min=1e-6)
+
+
+def _quat_error_mag_wxyz(q1, q2):
+    dot = torch.sum(q1 * q2, dim=-1).abs().clamp(max=1.0)
+    return 2.0 * torch.acos(dot)
+
+
+def _quat_from_yaw_wxyz(yaw):
+    quat = torch.zeros(yaw.shape[0], 4, device=yaw.device)
+    half = 0.5 * yaw
+    quat[:, 0] = torch.cos(half)
+    quat[:, 3] = torch.sin(half)
+    return quat
+
+
+def _calc_heading_quat_wxyz(quat):
+    ref_dir = torch.zeros(quat.shape[0], 3, device=quat.device, dtype=quat.dtype)
+    ref_dir[:, 0] = 1.0
+    rot_dir = _quat_apply_wxyz(quat, ref_dir)
+    heading = torch.atan2(rot_dir[:, 1], rot_dir[:, 0])
+    return _quat_from_yaw_wxyz(heading)
+
+
+def _quat_mul_wxyz(q, r):
+    w1, x1, y1, z1 = q.unbind(-1)
+    w2, x2, y2, z2 = r.unbind(-1)
+    return torch.stack(
+        (
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ),
+        dim=-1,
+    )
+
+
+def _wrap_to_pi(angles):
+    return torch.remainder(angles + math.pi, 2.0 * math.pi) - math.pi
+
+
+def _matrix_from_quat_wxyz(quat):
+    w, x, y, z = quat.unbind(-1)
+    ww, xx, yy, zz = w * w, x * x, y * y, z * z
+    wx, wy, wz = w * x, w * y, w * z
+    xy, xz, yz = x * y, x * z, y * z
+    row0 = torch.stack((ww + xx - yy - zz, 2.0 * (xy - wz), 2.0 * (xz + wy)), dim=-1)
+    row1 = torch.stack((2.0 * (xy + wz), ww - xx + yy - zz, 2.0 * (yz - wx)), dim=-1)
+    row2 = torch.stack((2.0 * (xz - wy), 2.0 * (yz + wx), ww - xx - yy + zz), dim=-1)
+    return torch.stack((row0, row1, row2), dim=-2)
+
+
+def _torch_rand_float(lower, upper, shape, device):
+    return (upper - lower) * torch.rand(*shape, device=device) + lower
+
+
+def _torch_rand_float_cpu(lower, upper, shape):
+    return (float(upper) - float(lower)) * torch.rand(*shape, device="cpu") + float(lower)
+
+
+def _resolve_reference_model_path(path):
+    return path if os.path.isabs(path) else os.path.join(LEGGED_GYM_ROOT_DIR, path)
+
+
+def _isaaclab_default_joint_angles():
+    joint_angles = dict(MrobotMimicCfg.init_state.default_joint_angles)
+    # IsaacLab validates URDF limits during articulation initialization.  The
+    # old IsaacGym default pose places these wrist roll joints just past the URDF
+    # limits, so clamp only the IsaacLab initial pose and keep the shared mimic
+    # config unchanged.
+    joint_angles["upper_left_7_joint"] = -1.04
+    joint_angles["upper_right_7_joint"] = 1.04
+    return joint_angles
+
+
+@configclass
+class MrobotMimicIsaacLabEnvCfg(DirectRLEnvCfg):
+    episode_length_s = MrobotMimicCfg.env.episode_length_s
+    decimation = MrobotMimicCfg.control.decimation
+    action_scale = MrobotMimicCfg.control.action_scale
+    action_space = MrobotMimicCfg.env.num_policy_actions
+    observation_space = MrobotMimicCfg.env.num_observations
+    state_space = MrobotMimicCfg.env.num_privileged_obs
+    reference_model_path = MrobotMimicCfg.motion.reference_model_path
+    use_local_plane_terrain = True
+    disable_domain_randomization = False
+    deterministic_reset = False
+    profile_step_timings = False
+    profile_step_timing_interval = 200
+    profile_step_timing_warmup = 20
+
+    sim: SimulationCfg = SimulationCfg(
+        dt=MrobotMimicCfg.sim.dt,
+        render_interval=decimation,
+        physx=PhysxCfg(
+            solver_type=MrobotMimicCfg.sim.physx.solver_type,
+            min_position_iteration_count=MrobotMimicCfg.sim.physx.num_position_iterations,
+            max_position_iteration_count=MrobotMimicCfg.sim.physx.num_position_iterations,
+            min_velocity_iteration_count=MrobotMimicCfg.sim.physx.num_velocity_iterations,
+            max_velocity_iteration_count=MrobotMimicCfg.sim.physx.num_velocity_iterations,
+            bounce_threshold_velocity=MrobotMimicCfg.sim.physx.bounce_threshold_velocity,
+            gpu_max_rigid_contact_count=MrobotMimicCfg.sim.physx.max_gpu_contact_pairs,
+        ),
+    )
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=3.0, replicate_physics=True)
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="average",
+            restitution_combine_mode="average",
+            static_friction=MrobotMimicCfg.terrain.static_friction,
+            dynamic_friction=MrobotMimicCfg.terrain.dynamic_friction,
+            restitution=MrobotMimicCfg.terrain.restitution,
+        ),
+        debug_vis=False,
+    )
+    robot: ArticulationCfg = ArticulationCfg(
+        prim_path="/World/envs/env_.*/Robot",
+        spawn=sim_utils.UrdfFileCfg(
+            asset_path=MrobotMimicCfg.asset.file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR),
+            fix_base=MrobotMimicCfg.asset.fix_base_link,
+            merge_fixed_joints=True,
+            activate_contact_sensors=True,
+            self_collision=not bool(MrobotMimicCfg.asset.self_collisions),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                max_depenetration_velocity=MrobotMimicCfg.sim.physx.max_depenetration_velocity,
+                solver_position_iteration_count=MrobotMimicCfg.sim.physx.num_position_iterations,
+                solver_velocity_iteration_count=MrobotMimicCfg.sim.physx.num_velocity_iterations,
+            ),
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=not bool(MrobotMimicCfg.asset.self_collisions),
+                solver_position_iteration_count=MrobotMimicCfg.sim.physx.num_position_iterations,
+                solver_velocity_iteration_count=MrobotMimicCfg.sim.physx.num_velocity_iterations,
+            ),
+            joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
+                gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=None, damping=None)
+            ),
+        ),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=tuple(MrobotMimicCfg.init_state.pos),
+            joint_pos=_isaaclab_default_joint_angles(),
+        ),
+        actuators={
+            "all": ImplicitActuatorCfg(
+                joint_names_expr=[".*"],
+                effort_limit_sim=MrobotMimicCfg.lab_joint_effort_limits,
+                velocity_limit_sim=MrobotMimicCfg.lab_joint_velocity_limits,
+                stiffness=0.0,
+                damping=0.0,
+            )
+        },
+    )
+    # Track only the IsaacGym termination body set.  Full-body contact sensing
+    # is much slower with thousands of IsaacLab envs; name-based mapping below
+    # keeps the subset order stable.
+    contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/.*(base_link|waist_yaw_link|pelvic_yaw_link|knee_pitch_link)",
+        history_length=1,
+        update_period=MrobotMimicCfg.sim.dt * MrobotMimicCfg.control.decimation,
+        track_air_time=False,
+    )
+
+
+class MrobotMimicIsaacLabEnv(DirectRLEnv):
+    cfg: MrobotMimicIsaacLabEnvCfg
+
+    def __init__(self, cfg, render_mode=None, **kwargs):
+        self.mrobot_cfg = MrobotMimicCfg()
+        if getattr(cfg, "disable_domain_randomization", False):
+            self.mrobot_cfg.domain_rand.randomize_friction = False
+            self.mrobot_cfg.domain_rand.randomize_restitution = False
+            self.mrobot_cfg.domain_rand.randomize_payload_mass = False
+            self.mrobot_cfg.domain_rand.randomize_com_displacement = False
+            self.mrobot_cfg.domain_rand.randomize_link_mass = False
+            self.mrobot_cfg.domain_rand.push_robots = False
+            self.mrobot_cfg.domain_rand.disturbance = False
+            self.mrobot_cfg.domain_rand.randomize_kp = False
+            self.mrobot_cfg.domain_rand.randomize_kd = False
+            self.mrobot_cfg.domain_rand.randomize_motor_strength = False
+            self.mrobot_cfg.domain_rand.randomize_motor_offset = False
+            self.mrobot_cfg.domain_rand.randomize_default_dof_pos_offset = False
+            self.mrobot_cfg.domain_rand.randomize_joint_friction = False
+            self.mrobot_cfg.domain_rand.randomize_joint_armature = False
+            self.mrobot_cfg.domain_rand.action_delay = False
+        super().__init__(cfg, render_mode, **kwargs)
+        self.backend = IsaacLabBackend(self, self.robot, self.contact_sensor)
+        self.num_policy_actions = self.cfg.action_space
+        self.num_actions = self.cfg.action_space
+        self.num_obs = self.cfg.observation_space
+        self.num_privileged_obs = self.cfg.state_space
+        self._init_buffers()
+        self._init_reference_network()
+        self._prepare_reward_function()
+        self.update_domain_rand_curriculum(0, force=True)
+        self._profile_step_count = 0
+        self._profile_accum = {}
+        self._active_profile_accum = None
+
+    def _profile_sync(self):
+        if "cuda" in str(self.device) and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _profile_record(self, accum, name, seconds):
+        if accum is not None:
+            accum[name] = accum.get(name, 0.0) + float(seconds)
+
+    def _profile_section_start(self):
+        if not getattr(self.cfg, "profile_step_timings", False) or self._active_profile_accum is None:
+            return None
+        self._profile_sync()
+        return time.perf_counter()
+
+    def _profile_section_end(self, name, start):
+        if start is None:
+            return
+        self._profile_sync()
+        self._profile_record(self._active_profile_accum, name, time.perf_counter() - start)
+
+    def _profile_report_step_timings(self, accum):
+        self._profile_step_count += 1
+        warmup = int(getattr(self.cfg, "profile_step_timing_warmup", 20))
+        if self._profile_step_count <= warmup:
+            return
+        for name, value in accum.items():
+            self._profile_accum[name] = self._profile_accum.get(name, 0.0) + value
+        interval = max(1, int(getattr(self.cfg, "profile_step_timing_interval", 200)))
+        profiled_steps = self._profile_step_count - warmup
+        if profiled_steps % interval != 0:
+            return
+        ordered_names = [
+            "pre_physics_step",
+            "apply_action",
+            "write_data_to_sim",
+            "sim_step",
+            "render",
+            "scene_update",
+            "counters",
+            "dones",
+            "dones_phase_ref",
+            "dones_state_cache",
+            "dones_push_contact",
+            "dones_contact_read",
+            "dones_termination",
+            "rewards",
+            "reset",
+            "reset_episode_logging",
+            "reset_robot_super",
+            "reset_bpm_ref",
+            "reset_domain_rand",
+            "reset_state_write",
+            "reset_cleanup",
+            "events",
+            "observations",
+            "obs_noise",
+            "state_root_joint",
+            "state_base_vel",
+            "state_body",
+            "total",
+        ]
+        pieces = []
+        for name in ordered_names:
+            if name in self._profile_accum:
+                pieces.append(f"{name}={self._profile_accum[name] * 1000.0 / interval:.3f}ms")
+        print(
+            "[MRobot IsaacLab profile] avg per env.step over "
+            f"{interval} steps: " + ", ".join(pieces),
+            flush=True,
+        )
+        self._profile_accum.clear()
+
+    def step(self, action):
+        if not getattr(self.cfg, "profile_step_timings", False):
+            return super().step(action)
+
+        accum = {}
+        self._active_profile_accum = accum
+        self._profile_sync()
+        total_start = last = time.perf_counter()
+
+        def mark(name):
+            nonlocal last
+            self._profile_sync()
+            now = time.perf_counter()
+            self._profile_record(accum, name, now - last)
+            last = now
+
+        action = action.to(self.device)
+        if self.cfg.action_noise_model:
+            action = self._action_noise_model(action)
+
+        self._pre_physics_step(action)
+        mark("pre_physics_step")
+
+        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        for _ in range(self.cfg.decimation):
+            self._sim_step_counter += 1
+            self._apply_action()
+            mark("apply_action")
+            self.scene.write_data_to_sim()
+            mark("write_data_to_sim")
+            self.sim.step(render=False)
+            mark("sim_step")
+            if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
+                self.sim.render()
+                mark("render")
+            self.scene.update(dt=self.physics_dt)
+            mark("scene_update")
+
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
+        mark("counters")
+
+        self.reset_terminated[:], self.reset_time_outs[:] = self._get_dones()
+        self.reset_buf = self.reset_terminated | self.reset_time_outs
+        mark("dones")
+
+        self.reward_buf = self._get_rewards()
+        mark("rewards")
+
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_env_ids) > 0:
+            self._reset_idx(reset_env_ids)
+            if self.sim.has_rtx_sensors() and self.cfg.num_rerenders_on_reset > 0:
+                for _ in range(self.cfg.num_rerenders_on_reset):
+                    self.sim.render()
+        mark("reset")
+
+        if self.cfg.events:
+            if "interval" in self.event_manager.available_modes:
+                self.event_manager.apply(mode="interval", dt=self.step_dt)
+        mark("events")
+
+        self.obs_buf = self._get_observations()
+        mark("observations")
+
+        if self.cfg.observation_noise_model:
+            self.obs_buf["policy"] = self._observation_noise_model(self.obs_buf["policy"])
+        mark("obs_noise")
+
+        self._profile_sync()
+        self._profile_record(accum, "total", time.perf_counter() - total_start)
+        self._profile_report_step_timings(accum)
+        self._active_profile_accum = None
+        return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
+
+    def _setup_scene(self):
+        self.robot = Articulation(self.cfg.robot)
+        self.contact_sensor = ContactSensor(self.cfg.contact_sensor)
+        use_local_plane = bool(self.cfg.use_local_plane_terrain and self.cfg.terrain.terrain_type == "plane")
+        if use_local_plane:
+            self._spawn_local_plane_terrain()
+            self.terrain = None
+        else:
+            self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+            self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+            self.terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+            self.scene._terrain = self.terrain
+        self.scene.clone_environments(copy_from_source=False)
+        if use_local_plane:
+            self.terrain = SimpleNamespace(env_origins=self.scene.env_origins, prim_path=self.cfg.terrain.prim_path)
+        if self.device == "cpu":
+            self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
+        self.scene.articulations["robot"] = self.robot
+        self.scene.sensors["contact_sensor"] = self.contact_sensor
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
+
+    def _spawn_local_plane_terrain(self):
+        """Spawn a local static ground plane without referencing IsaacSim's remote grid USD."""
+        ground_cfg = sim_utils.CuboidCfg(
+            size=(2000.0, 2000.0, 0.02),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+            physics_material=self.cfg.terrain.physics_material,
+        )
+        ground_cfg.func(self.cfg.terrain.prim_path, ground_cfg, translation=(0.0, 0.0, -0.01))
+
+    def _find_bodies(self, pattern):
+        ids, _ = self.robot.find_bodies(pattern)
+        return torch.as_tensor(ids, dtype=torch.long, device=self.device)
+
+    def _body_index_from_name(self, name, default=0):
+        ids, _ = self.robot.find_bodies(name)
+        if len(ids) == 0:
+            ids, _ = self.robot.find_bodies(".*{}.*".format(name))
+        return int(ids[0]) if len(ids) else int(default)
+
+    def _make_interval_steps(self, seconds_or_range):
+        if isinstance(seconds_or_range, (list, tuple)):
+            low = max(1, math.ceil(float(seconds_or_range[0]) / self.step_dt))
+            high = max(low, math.ceil(float(seconds_or_range[1]) / self.step_dt))
+            return (low, high), True
+        steps = max(1, math.ceil(float(seconds_or_range) / self.step_dt))
+        return steps, False
+
+    def _sample_push_interval_steps(self):
+        if self.randomize_push_interval:
+            low, high = self.push_interval
+            return int(torch.randint(low, high + 1, (1,), device=self.device).item())
+        return int(self.push_interval)
+
+    @staticmethod
+    def _scale_one_center_range(target_range, ratio):
+        low, high = float(target_range[0]), float(target_range[1])
+        return [1.0 + (low - 1.0) * ratio, 1.0 + (high - 1.0) * ratio]
+
+    @staticmethod
+    def _scale_zero_center_range(target_range, ratio):
+        return [float(target_range[0]) * ratio, float(target_range[1]) * ratio]
+
+    @staticmethod
+    def _scale_delay_range(target_range, ratio):
+        low, high = int(target_range[0]), int(target_range[1])
+        if ratio <= 0.0:
+            return [0, 1]
+        return [max(0, int(round(low * ratio))), max(1, int(round(high * ratio)))]
+
+    def _init_domain_rand_curriculum_buffers(self):
+        dr = self.mrobot_cfg.domain_rand
+        self._domain_rand_curriculum_stage = -1
+        self._target_push_robots = bool(getattr(dr, "push_robots", False))
+        self._target_disturbance = bool(getattr(dr, "disturbance", False))
+        self._target_randomize_restitution = bool(getattr(dr, "randomize_restitution", False))
+        self._target_randomize_payload_mass = bool(getattr(dr, "randomize_payload_mass", False))
+        self._target_randomize_com_displacement = bool(getattr(dr, "randomize_com_displacement", False))
+        self._target_randomize_link_mass = bool(getattr(dr, "randomize_link_mass", False))
+        self._target_randomize_kp = bool(getattr(dr, "randomize_kp", False))
+        self._target_randomize_kd = bool(getattr(dr, "randomize_kd", False))
+        self._target_randomize_motor_strength = bool(getattr(dr, "randomize_motor_strength", False))
+        self._target_randomize_motor_offset = bool(getattr(dr, "randomize_motor_offset", False))
+        self._target_action_delay = bool(getattr(dr, "action_delay", False))
+        self._target_max_push_vel_xy = float(getattr(dr, "max_push_vel_xy", 0.0))
+        self._target_max_push_ang_vel = float(getattr(dr, "max_push_ang_vel", 0.0))
+        self._target_disturbance_range = list(getattr(dr, "disturbance_range", [0.0, 0.0]))
+        self._target_restitution_range = list(getattr(dr, "restitution_range", [0.0, 0.0]))
+        self._target_payload_mass_range = list(getattr(dr, "payload_mass_range", [0.0, 0.0]))
+        self._target_com_x_pos_range = list(getattr(dr, "com_x_pos_range", [0.0, 0.0]))
+        self._target_com_y_pos_range = list(getattr(dr, "com_y_pos_range", [0.0, 0.0]))
+        self._target_com_z_pos_range = list(getattr(dr, "com_z_pos_range", [0.0, 0.0]))
+        self._target_link_mass_range = list(getattr(dr, "link_mass_range", [1.0, 1.0]))
+        self._target_kp_range = list(getattr(dr, "kp_range", [1.0, 1.0]))
+        self._target_kd_range = list(getattr(dr, "kd_range", [1.0, 1.0]))
+        self._target_motor_strength_range = list(getattr(dr, "motor_strength_range", [1.0, 1.0]))
+        self._target_motor_offset_range = list(getattr(dr, "motor_offset_range", [0.0, 0.0]))
+        self._target_action_delay_range = list(getattr(dr, "action_delay_range", [0, 1]))
+        self._adaptive_curriculum_mean_episode_length = 0.0
+        self._adaptive_curriculum_fall_ratio = 1.0
+        self._adaptive_curriculum_resets = 0
+        self._adaptive_curriculum_length_sum = torch.zeros((), device=self.device)
+        self._adaptive_curriculum_fall_sum = torch.zeros((), device=self.device)
+        self._adaptive_curriculum_pending_resets = 0
+        self._adaptive_curriculum_current_iteration = 0
+        self._adaptive_curriculum_stage_start_iteration = 0
+        self._current_push_ratio = 0.0
+        self._current_disturbance_ratio = 0.0
+        self._current_restitution_ratio = 0.0
+        self._current_payload_ratio = 0.0
+        self._current_com_ratio = 0.0
+        self._current_link_mass_ratio = 0.0
+        self._current_pd_ratio = 0.0
+        self._current_motor_strength_ratio = 0.0
+        self._current_motor_offset_ratio = 0.0
+        self._current_delay_ratio = 0.0
+
+    def update_domain_rand_curriculum(self, iteration, force=False):
+        dr = self.mrobot_cfg.domain_rand
+        if not getattr(dr, "use_curriculum", False):
+            return
+        self._flush_adaptive_curriculum_metrics()
+        self._adaptive_curriculum_current_iteration = iteration
+        push_schedule = list(getattr(dr, "push_ratio_schedule", [1.0]))
+        disturbance_schedule = list(getattr(dr, "disturbance_ratio_schedule", [1.0]))
+        restitution_schedule = list(getattr(dr, "restitution_ratio_schedule", [1.0]))
+        pd_schedule = list(getattr(dr, "pd_ratio_schedule", [1.0]))
+        motor_strength_schedule = list(getattr(dr, "motor_strength_ratio_schedule", [1.0]))
+        motor_offset_schedule = list(getattr(dr, "motor_offset_ratio_schedule", [1.0]))
+        delay_schedule = list(getattr(dr, "delay_ratio_schedule", [1.0]))
+        payload_schedule = list(getattr(dr, "payload_ratio_schedule", [1.0]))
+        com_schedule = list(getattr(dr, "com_ratio_schedule", [1.0]))
+        link_mass_schedule = list(getattr(dr, "link_mass_ratio_schedule", [1.0]))
+        num_stages = max(
+            len(push_schedule),
+            len(disturbance_schedule),
+            len(restitution_schedule),
+            len(pd_schedule),
+            len(motor_strength_schedule),
+            len(motor_offset_schedule),
+            len(delay_schedule),
+            len(payload_schedule),
+            len(com_schedule),
+            len(link_mass_schedule),
+        )
+        if num_stages == 0:
+            return
+        curriculum_mode = getattr(dr, "curriculum_mode", "iteration")
+        if curriculum_mode == "adaptive":
+            current_stage = max(self._domain_rand_curriculum_stage, 0)
+            stage_idx = current_stage
+            if (
+                iteration >= getattr(dr, "adaptive_min_iteration", 0)
+                and self._adaptive_curriculum_resets >= getattr(dr, "adaptive_min_resets", 0)
+                and (iteration - self._adaptive_curriculum_stage_start_iteration)
+                >= getattr(dr, "adaptive_stage_cooldown_iterations", 0)
+            ):
+                length_thresholds = list(getattr(dr, "adaptive_length_ratio_thresholds", [0.0] * num_stages))
+                fall_thresholds = list(getattr(dr, "adaptive_fall_ratio_thresholds", [1.0] * num_stages))
+                candidate_stage = min(current_stage + 1, num_stages - 1)
+                length_threshold = length_thresholds[min(candidate_stage, len(length_thresholds) - 1)]
+                fall_threshold = fall_thresholds[min(candidate_stage, len(fall_thresholds) - 1)]
+                mean_length_ratio = self._adaptive_curriculum_mean_episode_length / max(float(self.max_episode_length), 1.0)
+                if mean_length_ratio >= length_threshold and self._adaptive_curriculum_fall_ratio <= fall_threshold:
+                    stage_idx = candidate_stage
+        else:
+            stage_idx = 0
+            for idx, start_iter in enumerate(list(getattr(dr, "curriculum_stage_iters", [0]))):
+                if iteration >= start_iter:
+                    stage_idx = idx
+                else:
+                    break
+        if (not force) and stage_idx == self._domain_rand_curriculum_stage:
+            return
+        previous_stage = self._domain_rand_curriculum_stage
+        push_ratio = push_schedule[min(stage_idx, len(push_schedule) - 1)]
+        disturbance_ratio = disturbance_schedule[min(stage_idx, len(disturbance_schedule) - 1)]
+        restitution_ratio = restitution_schedule[min(stage_idx, len(restitution_schedule) - 1)]
+        pd_ratio = pd_schedule[min(stage_idx, len(pd_schedule) - 1)]
+        motor_strength_ratio = motor_strength_schedule[min(stage_idx, len(motor_strength_schedule) - 1)]
+        motor_offset_ratio = motor_offset_schedule[min(stage_idx, len(motor_offset_schedule) - 1)]
+        delay_ratio = delay_schedule[min(stage_idx, len(delay_schedule) - 1)]
+        payload_ratio = payload_schedule[min(stage_idx, len(payload_schedule) - 1)]
+        com_ratio = com_schedule[min(stage_idx, len(com_schedule) - 1)]
+        link_mass_ratio = link_mass_schedule[min(stage_idx, len(link_mass_schedule) - 1)]
+        dr.push_robots = self._target_push_robots and push_ratio > 0.0
+        dr.max_push_vel_xy = self._target_max_push_vel_xy * push_ratio
+        dr.max_push_ang_vel = self._target_max_push_ang_vel * push_ratio
+        dr.disturbance = self._target_disturbance and disturbance_ratio > 0.0
+        dr.disturbance_range = self._scale_zero_center_range(self._target_disturbance_range, disturbance_ratio)
+        dr.randomize_restitution = self._target_randomize_restitution and restitution_ratio > 0.0
+        dr.restitution_range = self._scale_zero_center_range(self._target_restitution_range, restitution_ratio)
+        dr.randomize_payload_mass = self._target_randomize_payload_mass and payload_ratio > 0.0
+        dr.payload_mass_range = self._scale_zero_center_range(self._target_payload_mass_range, payload_ratio)
+        dr.randomize_com_displacement = self._target_randomize_com_displacement and com_ratio > 0.0
+        dr.com_x_pos_range = self._scale_zero_center_range(self._target_com_x_pos_range, com_ratio)
+        dr.com_y_pos_range = self._scale_zero_center_range(self._target_com_y_pos_range, com_ratio)
+        dr.com_z_pos_range = self._scale_zero_center_range(self._target_com_z_pos_range, com_ratio)
+        dr.randomize_link_mass = self._target_randomize_link_mass and link_mass_ratio > 0.0
+        dr.link_mass_range = self._scale_one_center_range(self._target_link_mass_range, link_mass_ratio)
+        dr.randomize_kp = self._target_randomize_kp and pd_ratio > 0.0
+        dr.kp_range = self._scale_one_center_range(self._target_kp_range, pd_ratio)
+        dr.randomize_kd = self._target_randomize_kd and pd_ratio > 0.0
+        dr.kd_range = self._scale_one_center_range(self._target_kd_range, pd_ratio)
+        dr.randomize_motor_strength = self._target_randomize_motor_strength and motor_strength_ratio > 0.0
+        dr.motor_strength_range = self._scale_one_center_range(self._target_motor_strength_range, motor_strength_ratio)
+        dr.randomize_motor_offset = self._target_randomize_motor_offset and motor_offset_ratio > 0.0
+        dr.motor_offset_range = self._scale_zero_center_range(self._target_motor_offset_range, motor_offset_ratio)
+        dr.action_delay = self._target_action_delay and delay_ratio > 0.0
+        dr.action_delay_range = self._scale_delay_range(self._target_action_delay_range, delay_ratio)
+        self._domain_rand_curriculum_stage = stage_idx
+        if curriculum_mode == "adaptive" and stage_idx != previous_stage:
+            self._adaptive_curriculum_stage_start_iteration = iteration
+            self._adaptive_curriculum_mean_episode_length = 0.0
+            self._adaptive_curriculum_fall_ratio = 1.0
+            self._adaptive_curriculum_resets = 0
+            self._adaptive_curriculum_length_sum.zero_()
+            self._adaptive_curriculum_fall_sum.zero_()
+            self._adaptive_curriculum_pending_resets = 0
+        self._current_push_ratio = push_ratio
+        self._current_disturbance_ratio = disturbance_ratio
+        self._current_restitution_ratio = restitution_ratio
+        self._current_payload_ratio = payload_ratio
+        self._current_com_ratio = com_ratio
+        self._current_link_mass_ratio = link_mass_ratio
+        self._current_pd_ratio = pd_ratio
+        self._current_motor_strength_ratio = motor_strength_ratio
+        self._current_motor_offset_ratio = motor_offset_ratio
+        self._current_delay_ratio = delay_ratio
+        all_env_ids = torch.arange(self.num_envs, device=self.device)
+        self._randomize_reset_buffers(all_env_ids)
+
+    def _flush_adaptive_curriculum_metrics(self):
+        if self._adaptive_curriculum_pending_resets <= 0:
+            return
+        pending_resets = self._adaptive_curriculum_pending_resets
+        metric_sums = torch.stack(
+            (self._adaptive_curriculum_length_sum, self._adaptive_curriculum_fall_sum)
+        ).detach().cpu()
+        batch_mean_episode_length = float(metric_sums[0].item()) / max(float(pending_resets), 1.0)
+        fall_ratio = float(metric_sums[1].item()) / max(float(pending_resets), 1.0)
+        dr = self.mrobot_cfg.domain_rand
+        ema = getattr(dr, "adaptive_metric_ema", 0.9)
+        if self._adaptive_curriculum_resets == 0:
+            self._adaptive_curriculum_mean_episode_length = batch_mean_episode_length
+            self._adaptive_curriculum_fall_ratio = fall_ratio
+        else:
+            self._adaptive_curriculum_mean_episode_length = (
+                ema * self._adaptive_curriculum_mean_episode_length + (1.0 - ema) * batch_mean_episode_length
+            )
+            self._adaptive_curriculum_fall_ratio = ema * self._adaptive_curriculum_fall_ratio + (1.0 - ema) * fall_ratio
+        self._adaptive_curriculum_resets += pending_resets
+        self._adaptive_curriculum_length_sum.zero_()
+        self._adaptive_curriculum_fall_sum.zero_()
+        self._adaptive_curriculum_pending_resets = 0
+
+    def _canonical_to_sim_order(self, canonical_values):
+        sim_values = torch.zeros(self.num_envs, self.robot.num_joints, device=self.device)
+        sim_values[:, self.joint_sim_ids] = canonical_values
+        return sim_values
+
+    def _init_buffers(self):
+        cfg = self.mrobot_cfg
+        self.num_control = list(cfg.env.num_control)
+        self.num_notcontrol = list(cfg.env.num_notcontrol)
+        self.ref_num_notcontrol = list(cfg.env.ref_num_notcontrol)
+        self.canonical_joint_names = list(cfg.init_state.default_joint_angles.keys())
+        joint_sim_ids = [self.robot.joint_names.index(name) for name in self.canonical_joint_names]
+        self.joint_sim_ids = torch.tensor(joint_sim_ids, dtype=torch.long, device=self.device)
+        self.joint_sim_ids_list = [int(idx) for idx in joint_sim_ids]
+        self.joint_sim_ids_cpu = self.joint_sim_ids.detach().cpu()
+        self.full_actions = torch.zeros(self.num_envs, cfg.env.num_actions, device=self.device)
+        self.last_full_actions = torch.zeros_like(self.full_actions)
+        self.delayed_full_actions_scaled = torch.zeros_like(self.full_actions)
+        self.target_dof_pos = torch.zeros_like(self.full_actions)
+        self.sim_order_torques = torch.zeros(self.num_envs, self.robot.num_joints, device=self.device)
+        self.actions = torch.zeros(self.num_envs, self.num_policy_actions, device=self.device)
+        self.env_ids_arange = torch.arange(self.num_envs, device=self.device)
+        self.last_actions = torch.zeros_like(self.actions)
+        self.last_last_actions = torch.zeros_like(self.actions)
+        self.torques = torch.zeros(self.num_envs, cfg.env.num_actions, device=self.device)
+        self.default_dof_pos = self.robot.data.default_joint_pos[:, self.joint_sim_ids].clone()
+        self.dof_pos_limits = self.robot.data.joint_pos_limits[:, self.joint_sim_ids].clone()
+        self.p_gains = torch.zeros(cfg.env.num_actions, device=self.device)
+        self.d_gains = torch.zeros(cfg.env.num_actions, device=self.device)
+        for i, name in enumerate(self.canonical_joint_names):
+            for key, value in cfg.control.stiffness.items():
+                if key in name:
+                    self.p_gains[i] = value
+            for key, value in cfg.control.damping.items():
+                if key in name:
+                    self.d_gains[i] = value
+        torque_limits = torch.tensor(
+            [float(cfg.lab_joint_effort_limits[name]) for name in self.canonical_joint_names],
+            device=self.device,
+        )
+        torque_limits = torch.where(
+            torch.isfinite(torque_limits) & (torque_limits > 0.0),
+            torque_limits,
+            torch.ones_like(torque_limits) * 250.0,
+        )
+        self.torque_limits = torque_limits * cfg.safety.torque_limit
+        self.obs_scales = cfg.normalization.obs_scales
+        self.noise_scale_vec = self._get_noise_scale_vec()
+        self.bpm_cmd = torch.zeros(self.num_envs, 1, device=self.device)
+        self.init_phase_rad = torch.zeros(self.num_envs, 1, device=self.device)
+        self.phase_rad = torch.zeros(self.num_envs, 1, device=self.device)
+        self.normalized_bpm_cmd = torch.zeros(self.num_envs, 1, device=self.device)
+        self.ref_dof_pos = self.default_dof_pos.clone()
+        self.ref_dof_vel = torch.zeros_like(self.ref_dof_pos)
+        self.ref_pelvis_pos = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.ref_pelvis_vel = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.ref_pelvis_quat = self._identity_quat(1)
+        self.ref_pelvis_ang_vel = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.ref_feet_pos = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_feet_vel = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_feet_quat = self._identity_quat(2)
+        self.ref_feet_ang_vel = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_knee_pos = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_knee_vel = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_knee_quat = self._identity_quat(2)
+        self.ref_knee_ang_vel = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_hip_pos = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_hip_vel = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_hip_quat = self._identity_quat(2)
+        self.ref_hip_ang_vel = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_pelvic_yaw_pos = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_pelvic_yaw_vel = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_pelvic_yaw_quat = self._identity_quat(2)
+        self.ref_pelvic_yaw_ang_vel = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        self.ref_waist_pos = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.ref_waist_vel = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.ref_waist_quat = self._identity_quat(1)
+        self.ref_waist_ang_vel = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.tracking_ref_pos_buf = torch.zeros(self.num_envs, 10, 3, device=self.device)
+        self.tracking_ref_quat_buf = self._identity_quat(10)
+        self.tracking_ref_lin_vel_buf = torch.zeros(self.num_envs, 10, 3, device=self.device)
+        self.tracking_ref_ang_vel_buf = torch.zeros(self.num_envs, 10, 3, device=self.device)
+        self.ref_feet_contact = torch.zeros(self.num_envs, 2, device=self.device)
+        self.ref_root_linvel = torch.zeros(self.num_envs, 3, device=self.device)
+        self.ref_root_angvel = torch.zeros(self.num_envs, 3, device=self.device)
+        self.ref_euler_xyz = torch.zeros(self.num_envs, 3, device=self.device)
+        self.feet_indices = self._find_bodies(".*ankle_roll.*")
+        self.knee_indices = self._find_bodies(".*knee_pitch.*")
+        self.ankle_indices = self._find_bodies(".*ankle_pitch.*")
+        self.hip_indices = self._find_bodies(".*pelvic_roll.*")
+        self.pelvic_yaw_indices = self._find_bodies(".*pelvic_yaw.*")
+        self.base_indices = self._find_bodies("base_link")
+        self.waist_indices = self._find_bodies("waist_yaw_link")
+        self.base_body_id = int(self.base_indices[0].item()) if len(self.base_indices) else 0
+        self.waist_body_id = int(self.waist_indices[0].item()) if len(self.waist_indices) else self.base_body_id
+        self._validate_tracking_body_indices()
+        termination_robot_indices = torch.cat(
+            (self.base_indices, self.waist_indices, self.pelvic_yaw_indices, self.knee_indices), dim=0
+        ).long()
+        self.termination_contact_indices = self._contact_sensor_indices_for_robot_bodies(termination_robot_indices)
+        if len(self.termination_contact_indices) != len(termination_robot_indices):
+            sensor_names = ", ".join(getattr(self.contact_sensor, "body_names", []) or [])
+            robot_names = ", ".join(getattr(self.robot, "body_names", []) or [])
+            raise RuntimeError(
+                "MRobot IsaacLab termination contact mapping mismatch: "
+                f"sensor matched {len(self.termination_contact_indices)} bodies, "
+                f"expected {len(termination_robot_indices)}. "
+                f"contact_sensor.body_names=[{sensor_names}], robot.body_names=[{robot_names}]"
+            )
+        self.penalised_contact_indices = self.termination_contact_indices
+        self.all_tracking_indices = torch.cat(
+            (self.base_indices, self.feet_indices, self.knee_indices, self.hip_indices, self.pelvic_yaw_indices, self.waist_indices),
+            dim=0,
+        ).long()
+        self._tracking_pos_splits = (3, 6, 6, 6, 6, 3)
+        self._tracking_quat_splits = (4, 8, 8, 8, 8, 4)
+        self._tracking_cache_valid = False
+        self._tracking_cache_common_step = -1
+        self.contact_forces = self.backend.get_contact_forces()
+        self.rigid_state = self.robot.data.body_state_w
+        self.root_states = self.robot.data.root_state_w
+        self.dof_pos = self.robot.data.joint_pos[:, self.joint_sim_ids]
+        self.dof_vel = self.robot.data.joint_vel[:, self.joint_sim_ids]
+        self.base_quat = self.robot.data.root_quat_w
+        self.base_euler_xyz = _quat_wxyz_to_euler_xyz(self.base_quat)
+        self.base_lin_vel = self.robot.data.root_lin_vel_b
+        self.base_ang_vel = self.robot.data.root_ang_vel_b
+        self.last_dof_vel = torch.zeros_like(self.dof_vel)
+        self.last_root_vel = torch.zeros(self.num_envs, 6, device=self.device)
+        self.initial_base_yaw = torch.zeros(self.num_envs, device=self.device)
+        self.rand_push_force = torch.zeros(self.num_envs, 3, device=self.device)
+        self.rand_push_torque = torch.zeros(self.num_envs, 3, device=self.device)
+        self.disturbance_force = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.disturbance_torque = torch.zeros_like(self.disturbance_force)
+        self.external_force_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._external_force_active_any = False
+        self.payload = torch.zeros(self.num_envs, 1, device=self.device)
+        self.com_displacement = torch.zeros(self.num_envs, 3, device=self.device)
+        self.friction_coeffs = torch.ones(self.num_envs, 1, device=self.device) * cfg.terrain.static_friction
+        self.dynamic_friction_coeffs = torch.ones(self.num_envs, 1, device=self.device) * cfg.terrain.dynamic_friction
+        self.restitution_coeffs = torch.ones(self.num_envs, 1, device=self.device) * cfg.terrain.restitution
+        self.Kp_factors = torch.ones(self.num_envs, cfg.env.num_actions, device=self.device)
+        self.Kd_factors = torch.ones(self.num_envs, cfg.env.num_actions, device=self.device)
+        self.motor_strength_factors = torch.ones(self.num_envs, cfg.env.num_actions, device=self.device)
+        self.motor_offsets = torch.zeros(self.num_envs, cfg.env.num_actions, device=self.device)
+        self.default_dof_pos_offsets = torch.zeros(self.num_envs, cfg.env.num_actions, device=self.device)
+        self.common_step_counter = 0
+        self.joint_armature_coeffs = torch.zeros(self.num_envs, cfg.env.num_actions, device=self.device)
+        self.joint_friction_coeffs = torch.zeros(self.num_envs, cfg.env.num_actions, device=self.device)
+        self._joint_armature_written_once = False
+        self._joint_friction_written_once = False
+        self.default_masses = self.robot.data.default_mass.detach().cpu().clone()
+        self.default_inertias = self.robot.data.default_inertia.detach().cpu().clone()
+        self.default_coms = self.robot.root_physx_view.get_coms().clone().cpu()
+        self._physx_masses_cpu = self.default_masses.clone()
+        self._physx_inertias_cpu = self.default_inertias.clone()
+        self._physx_coms_cpu = self.default_coms.clone()
+        self._physx_materials_cpu = None
+        try:
+            self._physx_materials_cpu = self.robot.root_physx_view.get_material_properties().clone()
+        except Exception as exc:
+            if not getattr(self, "_reported_material_cache_error", False):
+                print("[HumanoidGym-Ex] MRobot IsaacLab material cache unavailable:", exc, flush=True)
+                self._reported_material_cache_error = True
+        self.payload_body_id = self._body_index_from_name(getattr(cfg.domain_rand, "payload_body_name", cfg.asset.base_name), default=0)
+        self.com_body_id = self._body_index_from_name(getattr(cfg.domain_rand, "com_body_name", cfg.asset.base_name), default=0)
+        self.disturbance_body_id = self._body_index_from_name(cfg.asset.base_name, default=0)
+        self.action_delay_buffer = None
+        self.action_delay_timestep = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.action_delay_write_idx = 0
+        self.action_delay_buffer_size = 0
+        if getattr(cfg.domain_rand, "action_delay", False):
+            max_delay = max(1, int(getattr(cfg.domain_rand, "action_delay_range", [0, 1])[1]))
+            self.action_delay_buffer_size = max_delay
+            self.action_delay_buffer = torch.zeros(self.num_envs, cfg.env.num_actions, max_delay, device=self.device)
+        self._ankle_obs_joint_indices = torch.tensor(
+            getattr(cfg.domain_rand, "ankle_obs_joint_indices", [4, 5, 10, 11]),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.ankle_reward_indices = torch.tensor([4, 5, 10, 11], dtype=torch.long, device=self.device)
+        n_ankle_obs = len(self._ankle_obs_joint_indices)
+        self.ankle_obs_pos_bias = torch.zeros(self.num_envs, n_ankle_obs, device=self.device)
+        self.ankle_obs_vel_bias = torch.zeros(self.num_envs, n_ankle_obs, device=self.device)
+        dr = cfg.domain_rand
+        self._use_actor_ankle_obs_randomization = any(
+            bool(getattr(dr, name, False))
+            for name in (
+                "randomize_ankle_obs_pos_bias",
+                "randomize_ankle_obs_vel_bias",
+                "randomize_ankle_obs_vel_noise",
+                "randomize_ankle_obs_vel_delay",
+                "randomize_ankle_obs_vel_filter",
+            )
+        )
+        self._use_ankle_pd_dq_randomization = any(
+            bool(getattr(dr, name, False))
+            for name in (
+                "randomize_ankle_pd_dq_noise",
+                "randomize_ankle_pd_dq_delay",
+                "randomize_ankle_pd_dq_filter",
+            )
+        )
+        self._init_ankle_dq_randomization_buffers(n_ankle_obs)
+        self._init_sys_delay_buffers()
+        self.push_interval, self.randomize_push_interval = self._make_interval_steps(cfg.domain_rand.push_interval_s)
+        self.next_push_step = self.common_step_counter + self._sample_push_interval_steps()
+        self.disturbance_interval = max(1, math.ceil(float(cfg.domain_rand.disturbance_s) / self.step_dt))
+        self.fall_reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.ref_end_reset_buf = torch.zeros_like(self.fall_reset_buf)
+        self.curriculum_episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._init_domain_rand_curriculum_buffers()
+        self._apply_substep = 0
+        self.last_torques = torch.zeros_like(self.torques)
+        self.reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.time_out_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.policy_obs_buf = torch.zeros(self.num_envs, cfg.env.num_observations, device=self.device)
+        self.privileged_obs_buf = torch.zeros(self.num_envs, cfg.env.num_privileged_obs, device=self.device)
+        self.priv_curr_buf = torch.zeros(self.num_envs, 146, device=self.device)
+        self._state_cache_common_step = -1
+        self._state_cache_valid = False
+
+    def _validate_tracking_body_indices(self):
+        expected = {
+            "base_link": (self.base_indices, 1),
+            "waist_yaw_link": (self.waist_indices, 1),
+            "ankle_roll feet": (self.feet_indices, 2),
+            "knee_pitch": (self.knee_indices, 2),
+            "pelvic_roll hip": (self.hip_indices, 2),
+            "pelvic_yaw": (self.pelvic_yaw_indices, 2),
+        }
+        bad = []
+        for label, (indices, count) in expected.items():
+            if len(indices) != count:
+                bad.append(f"{label}: got {len(indices)}, expected {count}")
+        if bad:
+            body_names = ", ".join(getattr(self.robot, "body_names", []))
+            raise RuntimeError(
+                "MRobot IsaacLab body mapping mismatch. "
+                + "; ".join(bad)
+                + ". Imported body_names=["
+                + body_names
+                + "]"
+            )
+
+    def _contact_sensor_indices_for_robot_bodies(self, robot_body_ids):
+        sensor_body_names = list(getattr(self.contact_sensor, "body_names", []) or [])
+        if len(sensor_body_names) == 0:
+            return torch.zeros(1, dtype=torch.long, device=self.device)
+        robot_body_names = list(getattr(self.robot, "body_names", []) or [])
+        ids = []
+        for robot_body_id in robot_body_ids.detach().cpu().tolist():
+            if 0 <= int(robot_body_id) < len(robot_body_names):
+                body_name = robot_body_names[int(robot_body_id)]
+                if body_name in sensor_body_names:
+                    ids.append(sensor_body_names.index(body_name))
+        if not ids and len(sensor_body_names) == 1:
+            ids = [0]
+        if not ids:
+            ids = [0]
+        return torch.as_tensor(ids, dtype=torch.long, device=self.device)
+
+    def _identity_quat(self, num_parts):
+        quat = torch.zeros(self.num_envs, num_parts, 4, device=self.device)
+        quat[..., 0] = 1.0
+        return quat
+
+    def _get_noise_scale_vec(self):
+        cfg = self.mrobot_cfg
+        noise_vec = torch.zeros(cfg.env.num_single_obs, device=self.device)
+        noise_scales = cfg.noise.noise_scales
+        n_ctrl = len(self.num_control)
+        noise_vec[0:n_ctrl] = noise_scales.dof_pos * self.obs_scales.dof_pos
+        noise_vec[n_ctrl:2 * n_ctrl] = noise_scales.dof_vel * self.obs_scales.dof_vel
+        noise_vec[2 * n_ctrl:3 * n_ctrl] = 0.0
+        noise_vec[3 * n_ctrl:3 * n_ctrl + 3] = noise_scales.ang_vel * self.obs_scales.ang_vel
+        noise_vec[3 * n_ctrl + 3:3 * n_ctrl + 6] = noise_scales.euler
+        return noise_vec
+
+    def _resample_ankle_obs_bias(self, env_ids):
+        if len(env_ids) == 0:
+            return
+        dr = self.mrobot_cfg.domain_rand
+        n = len(self._ankle_obs_joint_indices)
+        if getattr(dr, "randomize_ankle_obs_pos_bias", False):
+            low, high = getattr(dr, "ankle_obs_pos_bias_range", [-0.02, 0.02])
+            self.ankle_obs_pos_bias[env_ids] = _torch_rand_float(low, high, (len(env_ids), n), self.device)
+        else:
+            self.ankle_obs_pos_bias[env_ids] = 0.0
+        if getattr(dr, "randomize_ankle_obs_vel_bias", False):
+            low, high = getattr(dr, "ankle_obs_vel_bias_range", [-0.3, 0.3])
+            self.ankle_obs_vel_bias[env_ids] = _torch_rand_float(low, high, (len(env_ids), n), self.device)
+        else:
+            self.ankle_obs_vel_bias[env_ids] = 0.0
+
+    def _init_ankle_dq_randomization_buffers(self, n_ankle_obs):
+        dr = self.mrobot_cfg.domain_rand
+        obs_delay_range = getattr(dr, "ankle_obs_vel_delay_range", [0, 0])
+        pd_delay_range = getattr(dr, "ankle_pd_dq_delay_range", [0, 0])
+        max_obs_delay = int(max(obs_delay_range)) if len(obs_delay_range) > 0 else 0
+        max_pd_delay = int(max(pd_delay_range)) if len(pd_delay_range) > 0 else 0
+        self.ankle_obs_vel_delay_buffer = torch.zeros(
+            self.num_envs, n_ankle_obs, max(1, max_obs_delay + 1), device=self.device
+        )
+        self.ankle_obs_vel_delay_timestep = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.ankle_obs_vel_filter_alpha = torch.ones(self.num_envs, n_ankle_obs, device=self.device)
+        self.ankle_obs_vel_filtered = torch.zeros(self.num_envs, n_ankle_obs, device=self.device)
+        self.ankle_obs_vel_filter_initialized = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
+        self.ankle_pd_dq_delay_buffer = torch.zeros(
+            self.num_envs, n_ankle_obs, max(1, max_pd_delay + 1), device=self.device
+        )
+        self.ankle_pd_dq_delay_timestep = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.ankle_pd_dq_filter_alpha = torch.ones(self.num_envs, n_ankle_obs, device=self.device)
+        self.ankle_pd_dq_filtered = torch.zeros(self.num_envs, n_ankle_obs, device=self.device)
+        self.ankle_pd_dq_filter_initialized = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
+
+    def _sample_ankle_filter_alpha(self, env_ids, cutoff_range):
+        cutoff = _torch_rand_float(
+            float(cutoff_range[0]),
+            float(cutoff_range[1]),
+            (len(env_ids), len(self._ankle_obs_joint_indices)),
+            self.device,
+        ).clamp(min=0.0)
+        return (1.0 - torch.exp(-2.0 * math.pi * cutoff * self.step_dt)).clamp(0.0, 1.0)
+
+    def _resample_ankle_dq_randomization(self, env_ids):
+        if len(env_ids) == 0:
+            return
+        dr = self.mrobot_cfg.domain_rand
+        if getattr(dr, "randomize_ankle_obs_vel_delay", False):
+            low, high = getattr(dr, "ankle_obs_vel_delay_range", [0, 0])
+            self.ankle_obs_vel_delay_timestep[env_ids] = torch.randint(
+                int(low), int(high) + 1, (len(env_ids),), device=self.device
+            )
+        else:
+            self.ankle_obs_vel_delay_timestep[env_ids] = 0
+        if getattr(dr, "randomize_ankle_obs_vel_filter", False):
+            cutoff_range = getattr(dr, "ankle_obs_vel_filter_cutoff_range", [8.0, 20.0])
+            self.ankle_obs_vel_filter_alpha[env_ids] = self._sample_ankle_filter_alpha(env_ids, cutoff_range)
+        else:
+            self.ankle_obs_vel_filter_alpha[env_ids] = 1.0
+        self.ankle_obs_vel_delay_buffer[env_ids] = 0.0
+        self.ankle_obs_vel_filtered[env_ids] = 0.0
+        self.ankle_obs_vel_filter_initialized[env_ids] = False
+
+        if getattr(dr, "randomize_ankle_pd_dq_delay", False):
+            low, high = getattr(dr, "ankle_pd_dq_delay_range", [0, 0])
+            self.ankle_pd_dq_delay_timestep[env_ids] = torch.randint(
+                int(low), int(high) + 1, (len(env_ids),), device=self.device
+            )
+        else:
+            self.ankle_pd_dq_delay_timestep[env_ids] = 0
+        if getattr(dr, "randomize_ankle_pd_dq_filter", False):
+            cutoff_range = getattr(dr, "ankle_pd_dq_filter_cutoff_range", [8.0, 20.0])
+            self.ankle_pd_dq_filter_alpha[env_ids] = self._sample_ankle_filter_alpha(env_ids, cutoff_range)
+        else:
+            self.ankle_pd_dq_filter_alpha[env_ids] = 1.0
+        self.ankle_pd_dq_delay_buffer[env_ids] = 0.0
+        self.ankle_pd_dq_filtered[env_ids] = 0.0
+        self.ankle_pd_dq_filter_initialized[env_ids] = False
+
+    def _delay_ankle_signal(self, signal, delay_buffer, delay_timestep):
+        if delay_buffer.shape[-1] <= 1:
+            delay_buffer[:, :, 0] = signal
+            return signal
+        delay_buffer[:, :, 1:] = delay_buffer[:, :, :-1].clone()
+        delay_buffer[:, :, 0] = signal
+        return delay_buffer[self.env_ids_arange, :, delay_timestep.long()]
+
+    def _filter_ankle_signal(self, signal, filtered, alpha, initialized):
+        filtered[:] = torch.where(initialized, (1.0 - alpha) * filtered + alpha * signal, signal)
+        initialized[:] = True
+        return filtered
+
+    def _get_ankle_dq_for_pd(self):
+        if not self._use_ankle_pd_dq_randomization:
+            return self.dof_vel
+        dof_vel_for_pd = self.dof_vel.clone()
+        ankle_dq = self.dof_vel[:, self._ankle_obs_joint_indices]
+        dr = self.mrobot_cfg.domain_rand
+        if getattr(dr, "randomize_ankle_pd_dq_delay", False):
+            ankle_dq = self._delay_ankle_signal(ankle_dq, self.ankle_pd_dq_delay_buffer, self.ankle_pd_dq_delay_timestep)
+        if getattr(dr, "randomize_ankle_pd_dq_filter", False):
+            ankle_dq = self._filter_ankle_signal(
+                ankle_dq,
+                self.ankle_pd_dq_filtered,
+                self.ankle_pd_dq_filter_alpha,
+                self.ankle_pd_dq_filter_initialized,
+            )
+        if getattr(dr, "randomize_ankle_pd_dq_noise", False):
+            ankle_dq = ankle_dq + torch.randn_like(ankle_dq) * float(getattr(dr, "ankle_pd_dq_noise_std", 0.0))
+        dof_vel_for_pd[:, self._ankle_obs_joint_indices] = ankle_dq
+        return dof_vel_for_pd
+
+    def _apply_actor_ankle_obs_bias(self, q, dq):
+        if not self._use_actor_ankle_obs_randomization:
+            return q, dq
+        q_actor = q.clone()
+        dq_actor = dq.clone()
+        ankle_dq = dq_actor[:, self._ankle_obs_joint_indices]
+        dr = self.mrobot_cfg.domain_rand
+        if getattr(dr, "randomize_ankle_obs_vel_delay", False):
+            ankle_dq = self._delay_ankle_signal(ankle_dq, self.ankle_obs_vel_delay_buffer, self.ankle_obs_vel_delay_timestep)
+        if getattr(dr, "randomize_ankle_obs_vel_filter", False):
+            ankle_dq = self._filter_ankle_signal(
+                ankle_dq,
+                self.ankle_obs_vel_filtered,
+                self.ankle_obs_vel_filter_alpha,
+                self.ankle_obs_vel_filter_initialized,
+            )
+        if getattr(dr, "randomize_ankle_obs_vel_noise", False):
+            ankle_dq = ankle_dq + torch.randn_like(ankle_dq) * float(getattr(dr, "ankle_obs_vel_noise_std", 0.0)) * self.obs_scales.dof_vel
+        q_actor[:, self._ankle_obs_joint_indices] += self.ankle_obs_pos_bias * self.obs_scales.dof_pos
+        dq_actor[:, self._ankle_obs_joint_indices] = ankle_dq + self.ankle_obs_vel_bias * self.obs_scales.dof_vel
+        return q_actor, dq_actor
+
+    def _init_sys_delay_buffers(self):
+        dr = self.mrobot_cfg.domain_rand
+        self.obs_imu_delay_buffer = None
+        self.obs_motor_delay_buffer = None
+        self.obs_imu_delay_timestep = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.obs_motor_delay_timestep = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        if getattr(dr, "sys_delay", False):
+            imu_high = max(1, int(getattr(dr, "imu_delay_range", [0, 1])[1]))
+            motor_high = max(1, int(getattr(dr, "motor_delay_range", [0, 1])[1]))
+            self.obs_imu_delay_buffer = torch.zeros(self.num_envs, 13, imu_high, device=self.device)
+            self.obs_motor_delay_buffer = torch.zeros(self.num_envs, self.mrobot_cfg.env.num_actions * 2, motor_high, device=self.device)
+
+    def _resample_sys_delay(self, env_ids):
+        dr = self.mrobot_cfg.domain_rand
+        if not getattr(dr, "sys_delay", False) or self.obs_imu_delay_buffer is None:
+            self.obs_imu_delay_timestep[env_ids] = 0
+            self.obs_motor_delay_timestep[env_ids] = 0
+            return
+        self.obs_imu_delay_buffer[env_ids] = 0.0
+        self.obs_motor_delay_buffer[env_ids] = 0.0
+        imu_low, imu_high = getattr(dr, "imu_delay_range", [0, 1])
+        motor_low, motor_high = getattr(dr, "motor_delay_range", [0, 1])
+        imu_low_i = int(imu_low)
+        imu_high_i = max(imu_low_i + 1, int(imu_high))
+        motor_low_i = int(motor_low)
+        motor_high_i = max(motor_low_i + 1, int(motor_high))
+        self.obs_imu_delay_timestep[env_ids] = torch.randint(imu_low_i, imu_high_i, (len(env_ids),), device=self.device)
+        self.obs_motor_delay_timestep[env_ids] = torch.randint(motor_low_i, motor_high_i, (len(env_ids),), device=self.device)
+
+    def _record_sys_delay_state(self):
+        if self.obs_imu_delay_buffer is None:
+            return
+        self.obs_imu_delay_buffer[:, :, 1:] = self.obs_imu_delay_buffer[:, :, :-1].clone()
+        self.obs_imu_delay_buffer[:, :, 0] = self.robot.data.root_state_w.clone()
+        self.obs_motor_delay_buffer[:, :, 1:] = self.obs_motor_delay_buffer[:, :, :-1].clone()
+        self.obs_motor_delay_buffer[:, :, 0] = torch.cat((self.dof_pos, self.dof_vel), dim=1).clone()
+
+    def _prime_sys_delay_state(self, env_ids, root_state=None, dof_pos=None, dof_vel=None):
+        if self.obs_imu_delay_buffer is None:
+            return
+        if root_state is None:
+            root_state = self.robot.data.root_state_w[env_ids].clone()
+        if dof_pos is None:
+            dof_pos = self.dof_pos[env_ids].clone()
+        if dof_vel is None:
+            dof_vel = self.dof_vel[env_ids].clone()
+        motor_state = torch.cat((dof_pos, dof_vel), dim=1).clone()
+        self.obs_imu_delay_buffer[env_ids] = root_state.unsqueeze(-1).expand(-1, -1, self.obs_imu_delay_buffer.shape[-1])
+        self.obs_motor_delay_buffer[env_ids] = motor_state.unsqueeze(-1).expand(-1, -1, self.obs_motor_delay_buffer.shape[-1])
+
+    def _get_sys_delayed_obs_state(self):
+        root_states = self.obs_imu_delay_buffer[self.env_ids_arange, :, self.obs_imu_delay_timestep.long()]
+        dof_pos_vel = self.obs_motor_delay_buffer[self.env_ids_arange, :, self.obs_motor_delay_timestep.long()]
+        return root_states, dof_pos_vel
+
+    def _randomize_reset_buffers(self, env_ids):
+        dr = self.mrobot_cfg.domain_rand
+        n_envs = len(env_ids)
+        if getattr(dr, "randomize_kp", False):
+            self.Kp_factors[env_ids] = _torch_rand_float(dr.kp_range[0], dr.kp_range[1], (n_envs, self.mrobot_cfg.env.num_actions), self.device)
+        else:
+            self.Kp_factors[env_ids] = 1.0
+        if getattr(dr, "randomize_ankle_pd", False):
+            ankle_kp = getattr(dr, "ankle_kp_range", None)
+            ankle_idx = getattr(dr, "ankle_joint_indices", None)
+            if ankle_kp is not None and ankle_idx is not None:
+                for idx in ankle_idx:
+                    self.Kp_factors[env_ids, idx] = _torch_rand_float(ankle_kp[0], ankle_kp[1], (n_envs,), self.device)
+        if getattr(dr, "randomize_kd", False):
+            self.Kd_factors[env_ids] = _torch_rand_float(dr.kd_range[0], dr.kd_range[1], (n_envs, self.mrobot_cfg.env.num_actions), self.device)
+        else:
+            self.Kd_factors[env_ids] = 1.0
+        if getattr(dr, "randomize_ankle_pd", False):
+            ankle_kd = getattr(dr, "ankle_kd_range", None)
+            ankle_idx = getattr(dr, "ankle_joint_indices", None)
+            if ankle_kd is not None and ankle_idx is not None:
+                for idx in ankle_idx:
+                    self.Kd_factors[env_ids, idx] = _torch_rand_float(ankle_kd[0], ankle_kd[1], (n_envs,), self.device)
+        if getattr(dr, "randomize_motor_strength", False):
+            self.motor_strength_factors[env_ids] = _torch_rand_float(
+                dr.motor_strength_range[0], dr.motor_strength_range[1], (n_envs, self.mrobot_cfg.env.num_actions), self.device
+            )
+        else:
+            self.motor_strength_factors[env_ids] = 1.0
+        if getattr(dr, "randomize_motor_offset", False):
+            self.motor_offsets[env_ids] = _torch_rand_float(
+                dr.motor_offset_range[0], dr.motor_offset_range[1], (n_envs, self.mrobot_cfg.env.num_actions), self.device
+            )
+        else:
+            self.motor_offsets[env_ids] = 0.0
+        if getattr(dr, "randomize_ankle_motor_offset", False):
+            ankle_offset = getattr(dr, "ankle_motor_offset_range", None)
+            ankle_idx = getattr(dr, "ankle_joint_indices", None)
+            if ankle_offset is not None and ankle_idx is not None:
+                for idx in ankle_idx:
+                    self.motor_offsets[env_ids, idx] = _torch_rand_float(ankle_offset[0], ankle_offset[1], (n_envs,), self.device)
+        if getattr(dr, "randomize_default_dof_pos_offset", False):
+            offset_range = getattr(dr, "default_dof_pos_offset_range", [-0.01, 0.01])
+            self.default_dof_pos_offsets[env_ids] = _torch_rand_float(
+                offset_range[0], offset_range[1], (n_envs, self.mrobot_cfg.env.num_actions), self.device
+            )
+            ankle_range = getattr(dr, "default_dof_pos_offset_ankle_range", None)
+            if ankle_range is not None:
+                for idx in getattr(dr, "default_dof_pos_offset_ankle_indices", []):
+                    self.default_dof_pos_offsets[env_ids, idx] = _torch_rand_float(
+                        ankle_range[0], ankle_range[1], (n_envs,), self.device
+                    )
+        else:
+            self.default_dof_pos_offsets[env_ids] = 0.0
+        if self.action_delay_buffer is not None:
+            self.action_delay_buffer[env_ids] = 0.0
+            if getattr(dr, "action_delay", False):
+                low, high = getattr(dr, "action_delay_range", [0, 1])
+                low_i = int(low)
+                high_i = max(low_i + 1, int(high))
+                self.action_delay_timestep[env_ids] = torch.randint(low_i, high_i, (n_envs,), device=self.device)
+            else:
+                self.action_delay_timestep[env_ids] = 0
+        self._resample_ankle_obs_bias(env_ids)
+        self._resample_ankle_dq_randomization(env_ids)
+        self._resample_sys_delay(env_ids)
+        if self._should_resample_physx_randomization(env_ids):
+            self._randomize_materials(env_ids)
+            self._randomize_mass_and_com(env_ids)
+            self._randomize_joint_physx_props(env_ids)
+
+    def _should_resample_physx_randomization(self, env_ids):
+        dr = self.mrobot_cfg.domain_rand
+        if getattr(dr, "resample_physx_randomization_on_small_reset", True):
+            return True
+        return len(env_ids) == self.num_envs
+
+    def _randomize_materials(self, env_ids):
+        dr = self.mrobot_cfg.domain_rand
+        if not (getattr(dr, "randomize_friction", False) or getattr(dr, "randomize_restitution", False)):
+            self.friction_coeffs[env_ids] = self.mrobot_cfg.terrain.static_friction
+            self.dynamic_friction_coeffs[env_ids] = self.mrobot_cfg.terrain.dynamic_friction
+            self.restitution_coeffs[env_ids] = self.mrobot_cfg.terrain.restitution
+            return
+        env_ids_cpu = env_ids.detach().cpu()
+        n_envs = len(env_ids)
+        static_range = getattr(dr, "static_friction_range", getattr(dr, "friction_range", [1.0, 1.0]))
+        dynamic_range = getattr(dr, "dynamic_friction_range", getattr(dr, "friction_range", [1.0, 1.0]))
+        restitution_range = getattr(dr, "restitution_range", [0.0, 0.0])
+        static_cpu = _torch_rand_float_cpu(static_range[0], static_range[1], (n_envs, 1))
+        dynamic_cpu = _torch_rand_float_cpu(dynamic_range[0], dynamic_range[1], (n_envs, 1))
+        restitution_cpu = _torch_rand_float_cpu(restitution_range[0], restitution_range[1], (n_envs, 1))
+        if not getattr(dr, "randomize_friction", False):
+            static_cpu[:] = self.mrobot_cfg.terrain.static_friction
+            dynamic_cpu[:] = self.mrobot_cfg.terrain.dynamic_friction
+        if not getattr(dr, "randomize_restitution", False):
+            restitution_cpu[:] = self.mrobot_cfg.terrain.restitution
+        self.friction_coeffs[env_ids] = static_cpu.to(self.device)
+        self.dynamic_friction_coeffs[env_ids] = dynamic_cpu.to(self.device)
+        self.restitution_coeffs[env_ids] = restitution_cpu.to(self.device)
+        try:
+            if self._physx_materials_cpu is None:
+                self._physx_materials_cpu = self.robot.root_physx_view.get_material_properties().clone()
+            material_samples = self._physx_materials_cpu[env_ids_cpu].clone()
+            material_samples[..., 0] = static_cpu.expand_as(material_samples[..., 0])
+            material_samples[..., 1] = dynamic_cpu.expand_as(material_samples[..., 1])
+            material_samples[..., 2] = restitution_cpu.expand_as(material_samples[..., 2])
+            self._physx_materials_cpu[env_ids_cpu] = material_samples
+            self.robot.root_physx_view.set_material_properties(self._physx_materials_cpu, env_ids_cpu)
+        except Exception as exc:
+            if not getattr(self, "_reported_material_randomization_error", False):
+                print("[HumanoidGym-Ex] MRobot IsaacLab material randomization kept in buffers only:", exc, flush=True)
+                self._reported_material_randomization_error = True
+
+    def _randomize_mass_and_com(self, env_ids):
+        dr = self.mrobot_cfg.domain_rand
+        env_ids_cpu = env_ids.detach().cpu()
+        n_envs = len(env_ids)
+        self._physx_masses_cpu[env_ids_cpu] = self.default_masses[env_ids_cpu]
+        self._physx_inertias_cpu[env_ids_cpu] = self.default_inertias[env_ids_cpu]
+        if getattr(dr, "randomize_link_mass", False):
+            low, high = getattr(dr, "link_mass_range", [1.0, 1.0])
+            scale = _torch_rand_float_cpu(low, high, (n_envs, self.robot.num_bodies))
+            scale[:, self.payload_body_id] = 1.0
+            self._physx_masses_cpu[env_ids_cpu] = self.default_masses[env_ids_cpu] * scale
+            self._physx_inertias_cpu[env_ids_cpu] = self.default_inertias[env_ids_cpu] * scale.unsqueeze(-1)
+        if getattr(dr, "randomize_payload_mass", False):
+            low, high = getattr(dr, "payload_mass_range", [0.0, 0.0])
+            payload_cpu = _torch_rand_float_cpu(low, high, (n_envs, 1))
+        else:
+            payload_cpu = torch.zeros(n_envs, 1, device="cpu")
+        self.payload[env_ids] = payload_cpu.to(self.device)
+        base_payload_mass = self._physx_masses_cpu[env_ids_cpu, self.payload_body_id].clone()
+        new_payload_mass = torch.clamp(base_payload_mass + payload_cpu.squeeze(-1), min=1e-6)
+        ratio = new_payload_mass / torch.clamp(base_payload_mass, min=1e-6)
+        self._physx_masses_cpu[env_ids_cpu, self.payload_body_id] = new_payload_mass
+        self._physx_inertias_cpu[env_ids_cpu, self.payload_body_id] = (
+            self._physx_inertias_cpu[env_ids_cpu, self.payload_body_id] * ratio.unsqueeze(-1)
+        )
+        try:
+            self.robot.root_physx_view.set_masses(self._physx_masses_cpu, env_ids_cpu)
+            self.robot.root_physx_view.set_inertias(self._physx_inertias_cpu, env_ids_cpu)
+        except Exception as exc:
+            if not getattr(self, "_reported_mass_randomization_error", False):
+                print("[HumanoidGym-Ex] MRobot IsaacLab mass randomization kept in buffers only:", exc, flush=True)
+                self._reported_mass_randomization_error = True
+        com_offset_cpu = torch.tensor(
+            [
+                float(getattr(dr, "com_offset_x", 0.0)),
+                float(getattr(dr, "com_offset_y", 0.0)),
+                float(getattr(dr, "com_offset_z", 0.0)),
+            ],
+            device="cpu",
+        ).repeat(n_envs, 1)
+        if getattr(dr, "randomize_com_displacement", False):
+            com_offset_cpu[:, 0] += _torch_rand_float_cpu(dr.com_x_pos_range[0], dr.com_x_pos_range[1], (n_envs,))
+            com_offset_cpu[:, 1] += _torch_rand_float_cpu(dr.com_y_pos_range[0], dr.com_y_pos_range[1], (n_envs,))
+            com_offset_cpu[:, 2] += _torch_rand_float_cpu(dr.com_z_pos_range[0], dr.com_z_pos_range[1], (n_envs,))
+        self.com_displacement[env_ids] = com_offset_cpu.to(self.device)
+        try:
+            self._physx_coms_cpu[env_ids_cpu] = self.default_coms[env_ids_cpu]
+            self._physx_coms_cpu[env_ids_cpu, self.com_body_id, :3] = (
+                self.default_coms[env_ids_cpu, self.com_body_id, :3] + com_offset_cpu
+            )
+            self.robot.root_physx_view.set_coms(self._physx_coms_cpu, env_ids_cpu)
+        except Exception as exc:
+            if not getattr(self, "_reported_com_randomization_error", False):
+                print("[HumanoidGym-Ex] MRobot IsaacLab COM randomization kept in buffers only:", exc, flush=True)
+                self._reported_com_randomization_error = True
+
+    def _randomize_joint_physx_props(self, env_ids):
+        dr = self.mrobot_cfg.domain_rand
+        n_envs = len(env_ids)
+        randomize_armature = bool(getattr(dr, "randomize_joint_armature", False))
+        randomize_friction = bool(getattr(dr, "randomize_joint_friction", False))
+        if randomize_armature:
+            for i, rng in enumerate(getattr(dr, "joint_armature_range", [])):
+                self.joint_armature_coeffs[env_ids, i] = _torch_rand_float(rng[0], rng[1], (n_envs,), self.device)
+        else:
+            values = getattr(dr, "joint_armature_values", None)
+            if values is not None:
+                for i, value in enumerate(values[: self.mrobot_cfg.env.num_actions]):
+                    self.joint_armature_coeffs[env_ids, i] = float(value)
+            else:
+                self.joint_armature_coeffs[env_ids] = 0.0
+        if randomize_friction:
+            for i, rng in enumerate(getattr(dr, "joint_friction_range", [])):
+                self.joint_friction_coeffs[env_ids, i] = _torch_rand_float(rng[0], rng[1], (n_envs,), self.device)
+        else:
+            self.joint_friction_coeffs[env_ids] = 0.0
+        should_write_armature = randomize_armature or not self._joint_armature_written_once
+        should_write_friction = randomize_friction or not self._joint_friction_written_once
+        if not (should_write_armature or should_write_friction):
+            return
+        try:
+            if should_write_armature:
+                self.robot.write_joint_armature_to_sim(
+                    self.joint_armature_coeffs[env_ids],
+                    joint_ids=self.joint_sim_ids_list,
+                    env_ids=env_ids,
+                )
+                if not randomize_armature:
+                    self._joint_armature_written_once = True
+            if should_write_friction:
+                self.robot.write_joint_friction_coefficient_to_sim(
+                    self.joint_friction_coeffs[env_ids],
+                    joint_ids=self.joint_sim_ids_list,
+                    env_ids=env_ids,
+                )
+                if not randomize_friction:
+                    self._joint_friction_written_once = True
+        except Exception as exc:
+            if not getattr(self, "_reported_joint_prop_randomization_error", False):
+                print("[HumanoidGym-Ex] MRobot IsaacLab joint property randomization kept in buffers only:", exc, flush=True)
+                self._reported_joint_prop_randomization_error = True
+
+    def _init_reference_network(self):
+        path = _resolve_reference_model_path(getattr(self.cfg, "reference_model_path", self.mrobot_cfg.motion.reference_model_path))
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                "BPM reference model checkpoint not found: {}. Set env_cfg.reference_model_path; "
+                "datasets and checkpoints are intentionally not bundled.".format(path)
+            )
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.reference_output_columns = list(checkpoint["output_columns"])
+        self.reference_column_index = {name: idx for idx, name in enumerate(self.reference_output_columns)}
+        self.reference_bpm_mean = torch.tensor(float(checkpoint["bpm_mean"]), device=self.device)
+        self.reference_bpm_std = torch.tensor(float(checkpoint["bpm_std"]), device=self.device).clamp(min=1e-6)
+        self.reference_target_mean = torch.as_tensor(checkpoint["target_mean"], device=self.device, dtype=torch.float32)
+        self.reference_target_std = torch.as_tensor(checkpoint["target_std"], device=self.device, dtype=torch.float32)
+        self.reference_net = ReferenceStateNet(int(checkpoint["input_dim"]), int(checkpoint["output_dim"]), checkpoint["hidden"]).to(self.device)
+        self.reference_net.load_state_dict(checkpoint["model_state_dict"])
+        self.reference_net.eval()
+        for param in self.reference_net.parameters():
+            param.requires_grad_(False)
+        self.reference_input = torch.zeros(
+            self.num_envs,
+            int(checkpoint["input_dim"]),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.ref_dof_pos_indices, self.ref_dof_pos_mask = self._build_dof_column_indices("_pos")
+        self.ref_dof_vel_indices, self.ref_dof_vel_mask = self._build_dof_column_indices("_vel")
+
+    def _build_dof_column_indices(self, suffix):
+        reverse_alias = {env_name: data_name for data_name, env_name in JOINT_NAME_ALIASES.items()}
+        indices, mask = [], []
+        for dof_name in self.canonical_joint_names:
+            base = reverse_alias.get(dof_name, dof_name)
+            if base.endswith("_joint"):
+                base = base[:-6]
+            col_idx = self.reference_column_index.get(base + suffix, -1)
+            indices.append(max(col_idx, 0))
+            mask.append(col_idx >= 0)
+        return (
+            torch.tensor(indices, dtype=torch.long, device=self.device),
+            torch.tensor(mask, dtype=torch.bool, device=self.device),
+        )
+
+    def _extract_ref_field(self, pred, field_name, num_parts, width, kind):
+        axes = ("x", "y", "z") if width == 3 else ("x", "y", "z", "w")
+        values = torch.zeros(self.num_envs, num_parts, width, device=self.device)
+        if width == 4:
+            values[..., 3] = 1.0
+        for part_idx in range(num_parts):
+            for axis_idx, axis in enumerate(axes):
+                idx = self.reference_column_index.get(f"{field_name}_{kind}_{part_idx}_{axis}")
+                if idx is not None:
+                    values[:, part_idx, axis_idx] = pred[:, idx]
+        if width == 4:
+            values = _quat_xyzw_to_wxyz(values)
+            values = values / values.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        return values
+
+    def compute_ref_state(self):
+        self.phase_rad = torch.remainder(self.phase_rad, 2.0 * math.pi)
+        self.reference_input[:, 0:1] = (self.bpm_cmd - self.reference_bpm_mean) / self.reference_bpm_std
+        self.reference_input[:, 1:2] = torch.sin(self.phase_rad)
+        self.reference_input[:, 2:3] = torch.cos(self.phase_rad)
+        with torch.inference_mode():
+            pred = self.reference_net(self.reference_input) * self.reference_target_std + self.reference_target_mean
+        self.ref_dof_pos[:] = self.default_dof_pos
+        dof_pred = pred[:, self.ref_dof_pos_indices]
+        self.ref_dof_pos[:, self.ref_dof_pos_mask] = dof_pred[:, self.ref_dof_pos_mask]
+        self.ref_dof_vel.zero_()
+        dof_vel_pred = pred[:, self.ref_dof_vel_indices]
+        self.ref_dof_vel[:, self.ref_dof_vel_mask] = dof_vel_pred[:, self.ref_dof_vel_mask]
+        self.ref_pelvis_pos[:] = self._extract_ref_field(pred, "pelvis", 1, 3, "pos")
+        self.ref_pelvis_vel[:] = self._extract_ref_field(pred, "pelvis", 1, 3, "vel")
+        self.ref_pelvis_quat[:] = self._extract_ref_field(pred, "pelvis", 1, 4, "quat")
+        self.ref_pelvis_ang_vel[:] = self._extract_ref_field(pred, "pelvis", 1, 3, "ang_vel")
+        self.ref_feet_pos[:] = self._extract_ref_field(pred, "feet", 2, 3, "pos")
+        self.ref_feet_vel[:] = self._extract_ref_field(pred, "feet", 2, 3, "vel")
+        self.ref_feet_quat[:] = self._extract_ref_field(pred, "feet", 2, 4, "quat")
+        self.ref_feet_ang_vel[:] = self._extract_ref_field(pred, "feet", 2, 3, "ang_vel")
+        self.ref_knee_pos[:] = self._extract_ref_field(pred, "knee", 2, 3, "pos")
+        self.ref_knee_vel[:] = self._extract_ref_field(pred, "knee", 2, 3, "vel")
+        self.ref_knee_quat[:] = self._extract_ref_field(pred, "knee", 2, 4, "quat")
+        self.ref_knee_ang_vel[:] = self._extract_ref_field(pred, "knee", 2, 3, "ang_vel")
+        self.ref_hip_pos[:] = self._extract_ref_field(pred, "hip", 2, 3, "pos")
+        self.ref_hip_vel[:] = self._extract_ref_field(pred, "hip", 2, 3, "vel")
+        self.ref_hip_quat[:] = self._extract_ref_field(pred, "hip", 2, 4, "quat")
+        self.ref_hip_ang_vel[:] = self._extract_ref_field(pred, "hip", 2, 3, "ang_vel")
+        self.ref_pelvic_yaw_pos[:] = self._extract_ref_field(pred, "pelvic_yaw", 2, 3, "pos")
+        self.ref_pelvic_yaw_vel[:] = self._extract_ref_field(pred, "pelvic_yaw", 2, 3, "vel")
+        self.ref_pelvic_yaw_quat[:] = self._extract_ref_field(pred, "pelvic_yaw", 2, 4, "quat")
+        self.ref_pelvic_yaw_ang_vel[:] = self._extract_ref_field(pred, "pelvic_yaw", 2, 3, "ang_vel")
+        self.ref_waist_pos[:] = self._extract_ref_field(pred, "waist", 1, 3, "pos")
+        self.ref_waist_vel[:] = self._extract_ref_field(pred, "waist", 1, 3, "vel")
+        self.ref_waist_quat[:] = self._extract_ref_field(pred, "waist", 1, 4, "quat")
+        self.ref_waist_ang_vel[:] = self._extract_ref_field(pred, "waist", 1, 3, "ang_vel")
+        self.ref_root_linvel = self.ref_waist_vel[:, 0, :]
+        self.ref_root_angvel = self.ref_waist_ang_vel[:, 0, :]
+        self.ref_feet_contact = (self.ref_feet_pos[..., 2] < self.mrobot_cfg.motion.foot_contact_height_threshold).float()
+        self.ref_euler_xyz = _quat_wxyz_to_euler_xyz(self.ref_waist_quat[:, 0, :])
+        self.normalized_bpm_cmd = (self.bpm_cmd - self.reference_bpm_mean) / self.reference_bpm_std
+        self._refresh_tracking_ref_buffers()
+
+    def _refresh_tracking_ref_buffers(self):
+        self.tracking_ref_pos_buf[:, 0:1] = self.ref_pelvis_pos
+        self.tracking_ref_pos_buf[:, 1:3] = self.ref_feet_pos
+        self.tracking_ref_pos_buf[:, 3:5] = self.ref_knee_pos
+        self.tracking_ref_pos_buf[:, 5:7] = self.ref_hip_pos
+        self.tracking_ref_pos_buf[:, 7:9] = self.ref_pelvic_yaw_pos
+        self.tracking_ref_pos_buf[:, 9:10] = self.ref_waist_pos
+
+        self.tracking_ref_quat_buf[:, 0:1] = self.ref_pelvis_quat
+        self.tracking_ref_quat_buf[:, 1:3] = self.ref_feet_quat
+        self.tracking_ref_quat_buf[:, 3:5] = self.ref_knee_quat
+        self.tracking_ref_quat_buf[:, 5:7] = self.ref_hip_quat
+        self.tracking_ref_quat_buf[:, 7:9] = self.ref_pelvic_yaw_quat
+        self.tracking_ref_quat_buf[:, 9:10] = self.ref_waist_quat
+
+        self.tracking_ref_lin_vel_buf[:, 0:1] = self.ref_pelvis_vel
+        self.tracking_ref_lin_vel_buf[:, 1:3] = self.ref_feet_vel
+        self.tracking_ref_lin_vel_buf[:, 3:5] = self.ref_knee_vel
+        self.tracking_ref_lin_vel_buf[:, 5:7] = self.ref_hip_vel
+        self.tracking_ref_lin_vel_buf[:, 7:9] = self.ref_pelvic_yaw_vel
+        self.tracking_ref_lin_vel_buf[:, 9:10] = self.ref_waist_vel
+
+        self.tracking_ref_ang_vel_buf[:, 0:1] = self.ref_pelvis_ang_vel
+        self.tracking_ref_ang_vel_buf[:, 1:3] = self.ref_feet_ang_vel
+        self.tracking_ref_ang_vel_buf[:, 3:5] = self.ref_knee_ang_vel
+        self.tracking_ref_ang_vel_buf[:, 5:7] = self.ref_hip_ang_vel
+        self.tracking_ref_ang_vel_buf[:, 7:9] = self.ref_pelvic_yaw_ang_vel
+        self.tracking_ref_ang_vel_buf[:, 9:10] = self.ref_waist_ang_vel
+
+    def _advance_reference_phase(self):
+        self.phase_rad[:] = torch.remainder(
+            self.phase_rad + (2.0 * math.pi * self.bpm_cmd / 60.0) * self.step_dt,
+            2.0 * math.pi,
+        )
+
+    def _pred_column(self, pred, name, default):
+        idx = self.reference_column_index.get(name)
+        if idx is None:
+            return torch.full((self.num_envs,), float(default), device=self.device)
+        return pred[:, idx]
+
+    def _get_current_anchor_pose(self):
+        return self.rigid_state[:, self.waist_body_id, :3], self.rigid_state[:, self.waist_body_id, 3:7]
+
+    def _get_current_anchor_pose_local(self):
+        anchor_pos_w, anchor_quat = self._get_current_anchor_pose()
+        return anchor_pos_w - self.terrain.env_origins, anchor_quat
+
+    def _get_anchor_yaw_alignment(self, cur_anchor_quat=None):
+        if cur_anchor_quat is None:
+            _, cur_anchor_quat = self._get_current_anchor_pose()
+        ref_anchor_quat = self.ref_waist_quat[:, 0, :]
+        q_diff = _quat_mul_wxyz(cur_anchor_quat, _quat_inv_wxyz(ref_anchor_quat))
+        return _calc_heading_quat_wxyz(q_diff)
+
+    def _align_ref_positions_to_current_anchor(self, ref_body_pos, cur_anchor_pos=None, cur_anchor_quat=None):
+        if cur_anchor_pos is None or cur_anchor_quat is None:
+            cur_anchor_pos, cur_anchor_quat = self._get_current_anchor_pose_local()
+        ref_anchor_pos = self.ref_waist_pos[:, 0, :]
+        yaw_diff_quat = self._get_anchor_yaw_alignment(cur_anchor_quat)
+        rel_ref_pos = ref_body_pos - ref_anchor_pos.unsqueeze(1)
+        yaw_diff_repeat = yaw_diff_quat.unsqueeze(1).expand(-1, ref_body_pos.shape[1], -1)
+        rotated_rel_ref = _quat_apply_wxyz(yaw_diff_repeat.reshape(-1, 4), rel_ref_pos.reshape(-1, 3)).reshape_as(rel_ref_pos)
+        target_pos = cur_anchor_pos.unsqueeze(1) + rotated_rel_ref
+        target_pos[:, :, 2] = ref_body_pos[:, :, 2]
+        return target_pos
+
+    def _align_ref_quats_to_current_anchor(self, ref_body_quat, cur_anchor_quat=None):
+        yaw_diff_quat = self._get_anchor_yaw_alignment(cur_anchor_quat)
+        yaw_diff_repeat = yaw_diff_quat.unsqueeze(1).expand(-1, ref_body_quat.shape[1], -1)
+        return _quat_mul_wxyz(yaw_diff_repeat.reshape(-1, 4), ref_body_quat.reshape(-1, 4)).reshape_as(ref_body_quat)
+
+    def _align_ref_vectors_to_current_anchor(self, ref_body_vec, cur_anchor_quat=None):
+        yaw_diff_quat = self._get_anchor_yaw_alignment(cur_anchor_quat)
+        yaw_diff_repeat = yaw_diff_quat.unsqueeze(1).expand(-1, ref_body_vec.shape[1], -1)
+        return _quat_apply_wxyz(yaw_diff_repeat.reshape(-1, 4), ref_body_vec.reshape(-1, 3)).reshape_as(ref_body_vec)
+
+    def get_ref_rel_state_current(self, ref_pos_w, ref_quat_w):
+        r_pos_w = self.ref_waist_pos[:, 0, :]
+        r_quat_w = self.ref_waist_quat[:, 0, :]
+        r_inv_quat = _quat_inv_wxyz(r_quat_w)
+        num_parts = ref_pos_w.shape[1]
+        diff_p = ref_pos_w - r_pos_w.unsqueeze(1)
+        r_inv_repeat = r_inv_quat.unsqueeze(1).expand(-1, num_parts, -1).reshape(-1, 4)
+        rel_p = _quat_apply_wxyz(r_inv_repeat, diff_p.reshape(-1, 3)).reshape(self.num_envs, num_parts, 3)
+        rel_q = _quat_mul_wxyz(r_inv_repeat, ref_quat_w.reshape(-1, 4)).reshape(self.num_envs, num_parts, 4)
+        return rel_p.reshape(self.num_envs, -1), rel_q.reshape(self.num_envs, -1)
+
+    def get_rel_pose(self, indices, root_pos, root_quat):
+        pos_w = self.rigid_state[:, indices, :3]
+        quat_w = self.rigid_state[:, indices, 3:7]
+        num_parts = indices.shape[0]
+        p_rel_w = pos_w - root_pos.unsqueeze(1)
+        root_repeat = root_quat.unsqueeze(1).expand(-1, num_parts, -1).reshape(-1, 4)
+        p_rel_b = _quat_rotate_inverse_wxyz(root_repeat, p_rel_w.reshape(-1, 3)).reshape(self.num_envs, num_parts * 3)
+        inv_root_repeat = _quat_inv_wxyz(root_quat).unsqueeze(1).expand(-1, num_parts, -1).reshape(-1, 4)
+        q_rel_b = _quat_mul_wxyz(inv_root_repeat, quat_w.reshape(-1, 4)).reshape(self.num_envs, num_parts * 4)
+        return p_rel_b, q_rel_b
+
+    def _get_aligned_body_pos_targets(self, indices, ref_body_pos):
+        cur_body_pos = self.rigid_state[:, indices, :3] - self.terrain.env_origins.unsqueeze(1)
+        cur_anchor_pos, cur_anchor_quat = self._get_current_anchor_pose_local()
+        target_pos = self._align_ref_positions_to_current_anchor(ref_body_pos, cur_anchor_pos, cur_anchor_quat)
+        return cur_body_pos, target_pos
+
+    def _get_aligned_body_quat_targets(self, indices, ref_body_quat):
+        cur_body_quat = self.rigid_state[:, indices, 3:7]
+        _, cur_anchor_quat = self._get_current_anchor_pose()
+        target_quat = self._align_ref_quats_to_current_anchor(ref_body_quat, cur_anchor_quat)
+        return cur_body_quat, target_quat
+
+    def _get_aligned_body_vector_targets(self, indices, ref_body_vec, state_slice):
+        cur_body_vec = self.rigid_state[:, indices, state_slice]
+        _, cur_anchor_quat = self._get_current_anchor_pose()
+        target_vec = self._align_ref_vectors_to_current_anchor(ref_body_vec, cur_anchor_quat)
+        return cur_body_vec, target_vec
+
+    def _tracking_ref_pos(self):
+        return self.tracking_ref_pos_buf
+
+    def _tracking_ref_quat(self):
+        return self.tracking_ref_quat_buf
+
+    def _tracking_ref_lin_vel(self):
+        return self.tracking_ref_lin_vel_buf
+
+    def _tracking_ref_ang_vel(self):
+        return self.tracking_ref_ang_vel_buf
+
+    def _get_tracking_reward_cache(self):
+        if self._tracking_cache_valid and self._tracking_cache_common_step == self.common_step_counter:
+            return self._tracking_reward_cache
+        cur_anchor_pos, cur_anchor_quat = self._get_current_anchor_pose_local()
+        yaw_diff_quat = self._get_anchor_yaw_alignment(cur_anchor_quat)
+        ref_pos = self._tracking_ref_pos()
+        ref_quat = self._tracking_ref_quat()
+        ref_lin_vel = self._tracking_ref_lin_vel()
+        ref_ang_vel = self._tracking_ref_ang_vel()
+        yaw_diff_repeat = yaw_diff_quat.unsqueeze(1).expand(-1, ref_pos.shape[1], -1)
+
+        rel_ref_pos = ref_pos - self.ref_waist_pos[:, 0, :].unsqueeze(1)
+        target_pos = cur_anchor_pos.unsqueeze(1) + _quat_apply_wxyz(
+            yaw_diff_repeat.reshape(-1, 4),
+            rel_ref_pos.reshape(-1, 3),
+        ).reshape_as(rel_ref_pos)
+        target_pos[:, :, 2] = ref_pos[:, :, 2]
+        target_quat = _quat_mul_wxyz(yaw_diff_repeat.reshape(-1, 4), ref_quat.reshape(-1, 4)).reshape_as(ref_quat)
+        target_lin_vel = _quat_apply_wxyz(yaw_diff_repeat.reshape(-1, 4), ref_lin_vel.reshape(-1, 3)).reshape_as(ref_lin_vel)
+        target_ang_vel = _quat_apply_wxyz(yaw_diff_repeat.reshape(-1, 4), ref_ang_vel.reshape(-1, 3)).reshape_as(ref_ang_vel)
+
+        self._tracking_reward_cache = (
+            self.rigid_state[:, self.all_tracking_indices, :3] - self.terrain.env_origins.unsqueeze(1),
+            target_pos,
+            self.rigid_state[:, self.all_tracking_indices, 3:7],
+            target_quat,
+            self.rigid_state[:, self.all_tracking_indices, 7:10],
+            target_lin_vel,
+            self.rigid_state[:, self.all_tracking_indices, 10:13],
+            target_ang_vel,
+        )
+        self._tracking_cache_common_step = self.common_step_counter
+        self._tracking_cache_valid = True
+        return self._tracking_reward_cache
+
+    def _quat_err_6d(self, q_curr_flat, q_ref_flat, num_parts):
+        q_c = q_curr_flat.reshape(-1, 4)
+        q_r = q_ref_flat.reshape(-1, 4)
+        err_q = _quat_mul_wxyz(_quat_conjugate_wxyz(q_c), q_r)
+        err_mat = _matrix_from_quat_wxyz(err_q)
+        err_6d = err_mat[..., :2].reshape(-1, 6)
+        return err_6d.reshape(self.num_envs, num_parts * 6)
+
+    def _update_state_cache(self, force=False):
+        if not force and self._state_cache_valid and self._state_cache_common_step == self.common_step_counter:
+            return
+        profile_start = self._profile_section_start()
+        self.root_states = self.robot.data.root_state_w
+        self.dof_pos = self.robot.data.joint_pos[:, self.joint_sim_ids]
+        self.dof_vel = self.robot.data.joint_vel[:, self.joint_sim_ids]
+        self.base_quat = self.robot.data.root_quat_w
+        self.base_euler_xyz = _quat_wxyz_to_euler_xyz(self.base_quat)
+        self._profile_section_end("state_root_joint", profile_start)
+        profile_start = self._profile_section_start()
+        self.base_lin_vel = _quat_rotate_inverse_wxyz(self.base_quat, self.root_states[:, 7:10])
+        self.base_ang_vel = _quat_rotate_inverse_wxyz(self.base_quat, self.root_states[:, 10:13])
+        self._profile_section_end("state_base_vel", profile_start)
+        profile_start = self._profile_section_start()
+        self.rigid_state = self.robot.data.body_state_w
+        self._profile_section_end("state_body", profile_start)
+        self._state_cache_common_step = self.common_step_counter
+        self._state_cache_valid = True
+        self._tracking_cache_valid = False
+
+    def _pre_physics_step(self, actions):
+        actions = torch.clip(actions, -self.mrobot_cfg.normalization.clip_actions, self.mrobot_cfg.normalization.clip_actions)
+        self.last_last_actions[:] = self.last_actions
+        self.last_actions[:] = self.actions
+        self.actions[:] = actions
+        # Reference state is computed for the current policy time in
+        # _get_observations()/reset.  Recomputing here doubles reference-net
+        # forwards without changing the target used by this action.
+        self.full_actions.zero_()
+        self.full_actions[:, self.num_control] = actions
+        self.full_actions[:, self.num_notcontrol] = self.ref_dof_pos[:, self.ref_num_notcontrol] / self.cfg.action_scale
+        self._apply_substep = 0
+
+    def _apply_action(self):
+        self.dof_pos = self.robot.data.joint_pos[:, self.joint_sim_ids]
+        self.dof_vel = self.robot.data.joint_vel[:, self.joint_sim_ids]
+        if self.obs_imu_delay_buffer is not None:
+            self._record_sys_delay_state()
+        if self.mrobot_cfg.normalization.actions_filter:
+            rate = float(self._apply_substep + 1) / float(max(self.cfg.decimation, 1))
+            full_actions = (1.0 - rate) * self.last_full_actions + rate * self.full_actions
+        else:
+            full_actions = self.full_actions
+        scaled = full_actions * self.cfg.action_scale
+        if self.action_delay_buffer is not None and getattr(self.mrobot_cfg.domain_rand, "action_delay", False):
+            self.action_delay_buffer[:, :, self.action_delay_write_idx] = scaled
+            read_idx = torch.remainder(
+                self.action_delay_write_idx - self.action_delay_timestep.long(),
+                self.action_delay_buffer_size,
+            )
+            scaled = self.action_delay_buffer[self.env_ids_arange, :, read_idx]
+            self.action_delay_write_idx = (self.action_delay_write_idx + 1) % self.action_delay_buffer_size
+        self.delayed_full_actions_scaled[:] = scaled
+        target = self.target_dof_pos
+        target.copy_(self.ref_dof_pos)
+        if getattr(self.mrobot_cfg.control, "use_ref_residual_target", False):
+            target[:, self.num_control] = self.ref_dof_pos[:, self.num_control] + scaled[:, self.num_control]
+        else:
+            default_dof_pos_with_offset = self.default_dof_pos + self.default_dof_pos_offsets
+            target[:, self.num_control] = default_dof_pos_with_offset[:, self.num_control] + scaled[:, self.num_control]
+        target.add_(self.motor_offsets)
+        dof_vel_for_pd = self._get_ankle_dq_for_pd()
+        torques = self.Kp_factors * self.p_gains * (target - self.dof_pos) - self.Kd_factors * self.d_gains * dof_vel_for_pd
+        torques = torques * self.motor_strength_factors
+        self.torques = torch.clip(torques, -self.torque_limits, self.torque_limits)
+        if getattr(self.mrobot_cfg.domain_rand, "use_coulomb", False):
+            left = (
+                self.mrobot_cfg.domain_rand.left_Us
+                * torch.tanh(self.dof_vel[:, [4, 5]] / self.mrobot_cfg.domain_rand.left_Qs)
+                + self.mrobot_cfg.domain_rand.left_Ud * self.dof_vel[:, [4, 5]]
+            )
+            right = (
+                self.mrobot_cfg.domain_rand.right_Us
+                * torch.tanh(self.dof_vel[:, [10, 11]] / self.mrobot_cfg.domain_rand.right_Qs)
+                + self.mrobot_cfg.domain_rand.right_Ud * self.dof_vel[:, [10, 11]]
+            )
+            self.torques[:, [4, 5]] -= left
+            self.torques[:, [10, 11]] -= right
+            self.torques = torch.clip(self.torques, -self.torque_limits, self.torque_limits)
+        self.sim_order_torques.zero_()
+        self.sim_order_torques[:, self.joint_sim_ids] = self.torques
+        self.backend.set_dof_targets(self.sim_order_torques)
+        self._apply_substep += 1
+
+    def _get_observations(self):
+        self._update_state_cache()
+        anchor_pos_w, anchor_quat_w = self._get_current_anchor_pose()
+        anchor_pos_local, _ = self._get_current_anchor_pose_local()
+        tracking_p_b, tracking_q_b = self.get_rel_pose(self.all_tracking_indices, anchor_pos_w, anchor_quat_w)
+        (
+            self.pelvis_p_b,
+            self.feet_p_b,
+            self.knee_p_b,
+            self.hip_p_b,
+            self.pelvic_yaw_p_b,
+            self.waist_p_b,
+        ) = torch.split(tracking_p_b, self._tracking_pos_splits, dim=1)
+        (
+            self.pelvis_q_b,
+            self.feet_q_b,
+            self.knee_q_b,
+            self.hip_q_b,
+            self.pelvic_yaw_q_b,
+            self.waist_q_b,
+        ) = torch.split(tracking_q_b, self._tracking_quat_splits, dim=1)
+        ref_p0, ref_q0 = self.get_ref_rel_state_current(self._tracking_ref_pos(), self._tracking_ref_quat())
+        (
+            self.pelvis_p0,
+            self.f_p0,
+            self.k_p0,
+            self.h_p0,
+            self.pelvic_yaw_p0,
+            self.waist_p0,
+        ) = torch.split(ref_p0, self._tracking_pos_splits, dim=1)
+        (
+            self.pelvis_q0,
+            self.f_q0,
+            self.k_q0,
+            self.h_q0,
+            self.pelvic_yaw_q0,
+            self.waist_q0,
+        ) = torch.split(ref_q0, self._tracking_quat_splits, dim=1)
+        ref_anchor_pos = self.ref_waist_pos[:, 0, :]
+        ref_anchor_quat = self.ref_waist_quat[:, 0, :]
+        anchor_pos_b = _quat_rotate_inverse_wxyz(anchor_quat_w, ref_anchor_pos - anchor_pos_local)
+        anchor_quat_b = _quat_mul_wxyz(_quat_conjugate_wxyz(anchor_quat_w), ref_anchor_quat)
+        anchor_ori_b = _matrix_from_quat_wxyz(anchor_quat_b)[..., :2].reshape(self.num_envs, -1)
+        pelvis_err_p = self.pelvis_p_b - self.pelvis_p0
+        feet_err_p = self.feet_p_b - self.f_p0
+        knee_err_p = self.knee_p_b - self.k_p0
+        hip_err_p = self.hip_p_b - self.h_p0
+        pelvic_yaw_err_p = self.pelvic_yaw_p_b - self.pelvic_yaw_p0
+        waist_err_p = self.waist_p_b - self.waist_p0
+        pelvis_err_q = self._quat_err_6d(self.pelvis_q_b, self.pelvis_q0, 1)
+        feet_err_q = self._quat_err_6d(self.feet_q_b, self.f_q0, 2)
+        knee_err_q = self._quat_err_6d(self.knee_q_b, self.k_q0, 2)
+        hip_err_q = self._quat_err_6d(self.hip_q_b, self.h_q0, 2)
+        pelvic_yaw_err_q = self._quat_err_6d(self.pelvic_yaw_q_b, self.pelvic_yaw_q0, 2)
+        waist_err_q = self._quat_err_6d(self.waist_q_b, self.waist_q0, 1)
+        if getattr(self.mrobot_cfg.domain_rand, "sys_delay", False) and self.obs_imu_delay_buffer is not None:
+            root_states_obs, dof_pos_vel_obs = self._get_sys_delayed_obs_state()
+            q = (dof_pos_vel_obs[:, : self.mrobot_cfg.env.num_actions] - self.ref_dof_pos) * self.obs_scales.dof_pos
+            dq = dof_pos_vel_obs[:, self.mrobot_cfg.env.num_actions :] * self.obs_scales.dof_vel
+            base_ang_vel_obs = _quat_rotate_inverse_wxyz(root_states_obs[:, 3:7], root_states_obs[:, 10:13])
+            base_euler_obs = _quat_wxyz_to_euler_xyz(root_states_obs[:, 3:7])
+        else:
+            q = (self.dof_pos - self.ref_dof_pos) * self.obs_scales.dof_pos
+            dq = self.dof_vel * self.obs_scales.dof_vel
+            base_ang_vel_obs = self.base_ang_vel
+            base_euler_obs = self.base_euler_xyz[:, 0:3]
+        q, dq = self._apply_actor_ankle_obs_bias(q, dq)
+        phase_sin = torch.sin(self.phase_rad)
+        phase_cos = torch.cos(self.phase_rad)
+        obs_euler = base_euler_obs.clone()
+        obs_euler[:, 2] = _wrap_to_pi(obs_euler[:, 2] - self.initial_base_yaw)
+        obs_now = torch.cat(
+            (
+                q[:, self.num_control],
+                dq[:, self.num_control],
+                self.actions,
+                base_ang_vel_obs * self.obs_scales.ang_vel,
+                obs_euler * self.obs_scales.quat,
+                phase_sin,
+                phase_cos,
+                self.normalized_bpm_cmd,
+            ),
+            dim=-1,
+        )
+        ref_waist_euler = _quat_wxyz_to_euler_xyz(self.ref_waist_quat[:, 0, :])
+        goal_buf = torch.cat(
+            (
+                self.ref_dof_pos[:, self.num_control] * self.obs_scales.dof_pos,
+                self.ref_waist_pos[:, 0, 2:3],
+                ref_waist_euler[:, 0:2],
+                self.ref_waist_vel[:, 0, :] * self.obs_scales.lin_vel,
+                self.ref_waist_ang_vel[:, 0, 2:3] * self.obs_scales.ang_vel,
+            ),
+            dim=-1,
+        )
+        if self.mrobot_cfg.noise.add_noise:
+            obs_now = obs_now + (2.0 * torch.rand_like(obs_now) - 1.0) * self.noise_scale_vec * self.mrobot_cfg.noise.noise_level
+        self.policy_obs_buf[:, : self.mrobot_cfg.env.num_single_obs] = obs_now
+        self.policy_obs_buf[:, self.mrobot_cfg.env.num_single_obs :] = goal_buf
+        default_dof_pos_with_offset = self.default_dof_pos + self.default_dof_pos_offsets
+        priv_hist = torch.cat(
+            (
+                self.root_states[:, 2:3],
+                self.base_euler_xyz[:, 0:2],
+                (self.dof_pos - default_dof_pos_with_offset)[:, self.num_control] * self.obs_scales.dof_pos,
+                dq[:, self.num_control],
+                self.actions,
+                self.base_lin_vel * self.obs_scales.lin_vel,
+                self.base_ang_vel * self.obs_scales.ang_vel,
+            ),
+            dim=-1,
+        )
+        priv_curr = self.priv_curr_buf
+        priv_curr.zero_()
+        priv_curr[:, 0:3] = anchor_pos_b
+        priv_curr[:, 3:9] = anchor_ori_b
+        priv_curr[:, 9:12] = (self.base_lin_vel - self.ref_root_linvel) * self.obs_scales.lin_vel
+        priv_curr[:, 12:15] = (self.base_ang_vel - self.ref_root_angvel) * self.obs_scales.ang_vel
+        priv_curr[:, 15:18] = pelvis_err_p
+        priv_curr[:, 18:24] = pelvis_err_q
+        priv_curr[:, 24:30] = feet_err_p
+        priv_curr[:, 30:42] = feet_err_q
+        priv_curr[:, 42:48] = knee_err_p
+        priv_curr[:, 48:60] = knee_err_q
+        priv_curr[:, 60:66] = hip_err_p
+        priv_curr[:, 66:78] = hip_err_q
+        priv_curr[:, 78:84] = pelvic_yaw_err_p
+        priv_curr[:, 84:96] = pelvic_yaw_err_q
+        priv_curr[:, 96:99] = waist_err_p
+        priv_curr[:, 99:105] = waist_err_q
+        dr = self.mrobot_cfg.domain_rand
+        priv_curr[:, 105:107] = self.rand_push_force[:, :2] / max(float(getattr(dr, "max_push_vel_xy", 1.0)), 1e-6)
+        priv_curr[:, 107:110] = self.rand_push_torque / max(float(getattr(dr, "max_push_ang_vel", 1.0)), 1e-6)
+        priv_curr[:, 110:113] = self.disturbance_force[:, 0, :] / max(abs(float(getattr(dr, "disturbance_range", [-1.0, 1.0])[1])), 1e-6)
+        friction_range = getattr(dr, "static_friction_range", getattr(dr, "friction_range", [0.0, 1.0]))
+        restitution_range = getattr(dr, "restitution_range", [0.0, 1.0])
+        priv_curr[:, 113:114] = (self.friction_coeffs - friction_range[0]) / max(float(friction_range[1] - friction_range[0]), 1e-6)
+        priv_curr[:, 114:115] = (self.restitution_coeffs - restitution_range[0]) / max(
+            float(restitution_range[1] - restitution_range[0]), 1e-6
+        )
+        priv_curr[:, 115:127] = (self.Kp_factors[:, self.num_control] - dr.kp_range[0]) / max(float(dr.kp_range[1] - dr.kp_range[0]), 1e-6)
+        priv_curr[:, 127:139] = (self.Kd_factors[:, self.num_control] - dr.kd_range[0]) / max(float(dr.kd_range[1] - dr.kd_range[0]), 1e-6)
+        payload_range = getattr(dr, "payload_mass_range", [0.0, 1.0])
+        priv_curr[:, 139:140] = (self.payload - payload_range[0]) / max(float(payload_range[1] - payload_range[0]), 1e-6)
+        priv_curr[:, 140:143] = self.com_displacement * self.obs_scales.com_pos
+        priv_curr[:, -3:-1] = 1.0 - self.ref_feet_contact
+        priv_curr[:, -1:] = self.phase_rad / (2.0 * math.pi)
+        self.privileged_obs_buf[:, :45] = priv_hist
+        self.privileged_obs_buf[:, 45:191] = priv_curr
+        self.privileged_obs_buf[:, 191:] = goal_buf
+        if self.policy_obs_buf.shape[1] != self.mrobot_cfg.env.num_observations:
+            raise RuntimeError(
+                f"MRobot IsaacLab obs dim mismatch: got {self.policy_obs_buf.shape[1]}, "
+                f"cfg={self.mrobot_cfg.env.num_observations}"
+            )
+        if self.privileged_obs_buf.shape[1] != self.mrobot_cfg.env.num_privileged_obs:
+            raise RuntimeError(
+                f"MRobot IsaacLab privileged obs dim mismatch: got {self.privileged_obs_buf.shape[1]}, "
+                f"cfg={self.mrobot_cfg.env.num_privileged_obs}"
+            )
+        return {"policy": self.policy_obs_buf, "critic": self.privileged_obs_buf}
+
+    def _prepare_reward_function(self):
+        self.reward_scales = {}
+        for name in dir(self.mrobot_cfg.rewards.scales):
+            if name.startswith("_"):
+                continue
+            value = getattr(self.mrobot_cfg.rewards.scales, name)
+            if callable(value) or value == 0:
+                continue
+            self.reward_scales[name] = value * self.step_dt
+        self.reward_names = [name for name in self.reward_scales if name != "termination"]
+        self.reward_functions = [getattr(self, "_reward_" + name) for name in self.reward_names]
+        self.episode_sums = {name: torch.zeros(self.num_envs, device=self.device) for name in self.reward_scales}
+        self.tracking_score_names = [
+            name for name in self.reward_names if name.startswith("imitation") or name.startswith("imition")
+        ]
+        self.tracking_score_sums = {
+            name: torch.zeros(self.num_envs, device=self.device) for name in self.tracking_score_names
+        }
+
+    def _write_common_episode_infos(self, episode_info, env_ids=None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        if len(env_ids) == 0:
+            zero = torch.zeros((), device=self.device)
+            episode_info["mean_episode_length"] = zero
+            episode_info["fall_ratio"] = zero
+            episode_info["ref_end_ratio"] = zero
+            episode_info["time_out_ratio"] = zero
+        else:
+            episode_info["mean_episode_length"] = torch.mean(self.curriculum_episode_length_buf[env_ids].float())
+            episode_info["fall_ratio"] = torch.mean(self.fall_reset_buf[env_ids].float())
+            episode_info["ref_end_ratio"] = torch.mean(self.ref_end_reset_buf[env_ids].float())
+            episode_info["time_out_ratio"] = torch.mean(self.time_out_buf[env_ids].float())
+        episode_info["curriculum_stage"] = torch.tensor(float(max(self._domain_rand_curriculum_stage, 0)), device=self.device)
+        episode_info["push_ratio"] = torch.tensor(float(self._current_push_ratio), device=self.device)
+        episode_info["disturbance_ratio"] = torch.tensor(float(self._current_disturbance_ratio), device=self.device)
+        episode_info["restitution_ratio"] = torch.tensor(float(self._current_restitution_ratio), device=self.device)
+        episode_info["pd_ratio"] = torch.tensor(float(self._current_pd_ratio), device=self.device)
+        episode_info["motor_strength_ratio"] = torch.tensor(float(self._current_motor_strength_ratio), device=self.device)
+        episode_info["delay_ratio"] = torch.tensor(float(self._current_delay_ratio), device=self.device)
+
+    def _get_rewards(self):
+        rewards = torch.zeros(self.num_envs, device=self.device)
+        self.extras.pop("episode", None)
+        for name, func in zip(self.reward_names, self.reward_functions):
+            raw_rew = func()
+            rew = raw_rew * self.reward_scales[name]
+            rewards += rew
+            self.episode_sums[name] += rew
+            if name in self.tracking_score_sums:
+                self.tracking_score_sums[name] += raw_rew
+        if "termination" in self.reward_scales:
+            rew = self.reset_buf.float() * self.reward_scales["termination"]
+            rewards += rew
+            self.episode_sums["termination"] += rew
+        self.last_full_actions[:] = self.full_actions
+        self.last_dof_vel[:] = self.dof_vel
+        self.last_root_vel[:] = self.root_states[:, 7:13]
+        self.last_torques[:] = self.torques
+        return rewards
+
+    def _post_physics_step_callback(self):
+        dr = self.mrobot_cfg.domain_rand
+        if getattr(dr, "push_robots", False):
+            if self.common_step_counter >= self.next_push_step:
+                self._push_robots()
+                self.next_push_step = self.common_step_counter + self._sample_push_interval_steps()
+            self._clear_external_forces()
+        elif getattr(dr, "disturbance", False) and self.common_step_counter % self.disturbance_interval == 0:
+            self._disturbance_robots()
+        else:
+            self._clear_external_forces()
+
+    def _push_robots(self):
+        dr = self.mrobot_cfg.domain_rand
+        max_vel = float(getattr(dr, "max_push_vel_xy", 0.0))
+        max_ang = float(getattr(dr, "max_push_ang_vel", 0.0))
+        self.rand_push_force[:, :2] = _torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), self.device)
+        self.rand_push_force[:, 2] = 0.0
+        self.rand_push_torque[:] = _torch_rand_float(-max_ang, max_ang, (self.num_envs, 3), self.device)
+        root_velocity = self.robot.data.root_vel_w.clone()
+        root_velocity[:, 0:2] += self.rand_push_force[:, :2]
+        root_velocity[:, 3:6] = self.rand_push_torque
+        self.robot.write_root_velocity_to_sim(root_velocity)
+
+    def _disturbance_robots(self):
+        dr = self.mrobot_cfg.domain_rand
+        disturbance = _torch_rand_float(dr.disturbance_range[0], dr.disturbance_range[1], (self.num_envs, 1, 3), self.device)
+        self.disturbance_force[:] = disturbance
+        self.disturbance_torque.zero_()
+        body_ids = torch.tensor([self.disturbance_body_id], dtype=torch.long, device=self.device)
+        self.robot.set_external_force_and_torque(
+            forces=self.disturbance_force,
+            torques=self.disturbance_torque,
+            body_ids=body_ids,
+            env_ids=torch.arange(self.num_envs, device=self.device),
+            is_global=False,
+        )
+        self.external_force_active[:] = True
+        self._external_force_active_any = True
+
+    def _clear_external_forces(self, env_ids=None):
+        if not self._external_force_active_any:
+            return
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        forces = torch.zeros(len(env_ids), 1, 3, device=self.device)
+        body_ids = torch.tensor([self.disturbance_body_id], dtype=torch.long, device=self.device)
+        self.robot.set_external_force_and_torque(
+            forces=forces,
+            torques=torch.zeros_like(forces),
+            body_ids=body_ids,
+            env_ids=env_ids,
+            is_global=False,
+        )
+        self.external_force_active[env_ids] = False
+        if len(env_ids) == self.num_envs:
+            self._external_force_active_any = False
+
+    def _get_dones(self):
+        profile_start = self._profile_section_start()
+        self._advance_reference_phase()
+        self.compute_ref_state()
+        self._profile_section_end("dones_phase_ref", profile_start)
+        profile_start = self._profile_section_start()
+        self._update_state_cache()
+        self._profile_section_end("dones_state_cache", profile_start)
+        profile_start = self._profile_section_start()
+        self.curriculum_episode_length_buf += 1
+        self._post_physics_step_callback()
+        self._profile_section_end("dones_push_contact", profile_start)
+        profile_start = self._profile_section_start()
+        self.contact_forces = self.backend.get_contact_forces()
+        self._profile_section_end("dones_contact_read", profile_start)
+        profile_start = self._profile_section_start()
+        self.time_out_buf = self.episode_length_buf > self.max_episode_length
+        contact_died = torch.zeros_like(self.time_out_buf)
+        if len(self.termination_contact_indices) > 0:
+            contact_died = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.0, dim=1)
+        low = self.root_states[:, 2] < 0.5
+        self.fall_reset_buf = (contact_died | low) & (self.episode_length_buf > 5)
+        self.ref_end_reset_buf[:] = False
+        self.reset_buf = self.fall_reset_buf
+        self._profile_section_end("dones_termination", profile_start)
+        return self.reset_buf, self.time_out_buf
+
+    def _reset_idx(self, env_ids):
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self.robot._ALL_INDICES
+        profile_start = self._profile_section_start()
+        if hasattr(self, "episode_sums"):
+            self.extras["episode"] = {}
+            denom = self.episode_length_buf[env_ids].float() + 1.0
+            episode_lengths = self.curriculum_episode_length_buf[env_ids].float()
+            dr = self.mrobot_cfg.domain_rand
+            adaptive_min_iteration = getattr(dr, "adaptive_min_iteration", 0)
+            if self._adaptive_curriculum_current_iteration >= adaptive_min_iteration and len(env_ids) > 0:
+                self._adaptive_curriculum_length_sum += torch.sum(episode_lengths)
+                self._adaptive_curriculum_fall_sum += torch.sum(self.fall_reset_buf[env_ids].float())
+                self._adaptive_curriculum_pending_resets += int(len(env_ids))
+            for name in self.episode_sums:
+                self.extras["episode"]["rew_" + name] = torch.mean(self.episode_sums[name][env_ids] / denom)
+                self.episode_sums[name][env_ids] = 0.0
+            if hasattr(self, "tracking_score_sums"):
+                for name in self.tracking_score_sums:
+                    self.extras["episode"]["score_" + name] = torch.mean(
+                        self.tracking_score_sums[name][env_ids] / denom
+                    )
+                    self.tracking_score_sums[name][env_ids] = 0.0
+            self._write_common_episode_infos(self.extras["episode"], env_ids)
+        self._profile_section_end("reset_episode_logging", profile_start)
+        profile_start = self._profile_section_start()
+        self.robot.reset(env_ids)
+        super()._reset_idx(env_ids)
+        self._profile_section_end("reset_robot_super", profile_start)
+        profile_start = self._profile_section_start()
+        motion = self.mrobot_cfg.motion
+        if motion.fixed_bpm is not None:
+            bpm = torch.full((len(env_ids), 1), float(motion.fixed_bpm), device=self.device)
+        elif motion.sample_integer_bpm:
+            bpm_min = int(round(float(motion.bpm_range[0])))
+            bpm_max = int(round(float(motion.bpm_range[1])))
+            if bpm_max < bpm_min:
+                raise ValueError(f"Invalid bpm_range: {motion.bpm_range}")
+            num_regular_bpms = bpm_max - bpm_min + 1
+            if motion.include_zero_bpm:
+                bpm_choice = torch.randint(0, num_regular_bpms + 1, (len(env_ids), 1), device=self.device)
+                bpm = torch.where(
+                    bpm_choice == 0,
+                    torch.zeros_like(bpm_choice),
+                    bpm_choice + bpm_min - 1,
+                ).float()
+            else:
+                bpm = torch.randint(bpm_min, bpm_max + 1, (len(env_ids), 1), device=self.device).float()
+        else:
+            bpm = _torch_rand_float(float(motion.bpm_range[0]), float(motion.bpm_range[1]), (len(env_ids), 1), self.device)
+            if motion.include_zero_bpm:
+                zero_mask = torch.rand(len(env_ids), 1, device=self.device) < 0.5
+                bpm = torch.where(zero_mask, torch.zeros_like(bpm), bpm)
+        self.bpm_cmd[env_ids] = bpm
+        if getattr(motion, "randomize_init_phase", True):
+            self.init_phase_rad[env_ids] = _torch_rand_float(
+                float(motion.init_phase_range[0]), float(motion.init_phase_range[1]), (len(env_ids), 1), self.device
+            )
+        else:
+            self.init_phase_rad[env_ids] = 0.0
+        self.phase_rad[env_ids] = self.init_phase_rad[env_ids]
+        self.compute_ref_state()
+        self._profile_section_end("reset_bpm_ref", profile_start)
+        profile_start = self._profile_section_start()
+        self._randomize_reset_buffers(env_ids)
+        self._profile_section_end("reset_domain_rand", profile_start)
+        profile_start = self._profile_section_start()
+        root = self.robot.data.default_root_state[env_ids].clone()
+        root[:, :3] += self.terrain.env_origins[env_ids]
+        root[:, 7:13] = 0.0
+        root[:, 7:9] = _torch_rand_float(-0.1, 0.1, (len(env_ids), 2), self.device)
+        dr = self.mrobot_cfg.domain_rand
+        if not self.cfg.deterministic_reset and getattr(dr, "randomize_root_xy_reset", False):
+            xy_range = getattr(dr, "root_xy_reset_range", [0.0, 0.0])
+            root[:, 0:2] += _torch_rand_float(float(xy_range[0]), float(xy_range[1]), (len(env_ids), 2), self.device)
+        if not self.cfg.deterministic_reset and getattr(dr, "randomize_root_yaw_reset", False):
+            yaw_range = getattr(dr, "root_yaw_reset_range", [0.0, 0.0])
+            yaw_noise = _torch_rand_float(float(yaw_range[0]), float(yaw_range[1]), (len(env_ids),), self.device)
+            root[:, 3:7] = _quat_mul_wxyz(_quat_from_yaw_wxyz(yaw_noise), root[:, 3:7])
+        self.initial_base_yaw[env_ids] = _quat_wxyz_to_euler_xyz(root[:, 3:7])[:, 2]
+        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
+        ref_joint_pos = self.ref_dof_pos[env_ids].clone()
+        if not self.cfg.deterministic_reset and getattr(dr, "randomize_init_dof_pos", False):
+            init_range = getattr(dr, "init_dof_pos_range", [-0.03, 0.03])
+            ref_joint_pos += _torch_rand_float(
+                float(init_range[0]), float(init_range[1]), (len(env_ids), len(self.joint_sim_ids)), self.device
+            )
+        lower = self.dof_pos_limits[env_ids, :, 0]
+        upper = self.dof_pos_limits[env_ids, :, 1]
+        ref_joint_pos = torch.minimum(torch.maximum(ref_joint_pos, lower), upper)
+        joint_pos[:, self.joint_sim_ids] = ref_joint_pos
+        joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
+        joint_vel[:, self.joint_sim_ids] = self.ref_dof_vel[env_ids]
+        self.robot.write_root_pose_to_sim(root[:, :7], env_ids)
+        self.robot.write_root_velocity_to_sim(root[:, 7:], env_ids)
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        self._profile_section_end("reset_state_write", profile_start)
+        profile_start = self._profile_section_start()
+        self.dof_pos = joint_pos[:, self.joint_sim_ids]
+        self.dof_vel = joint_vel[:, self.joint_sim_ids]
+        self._prime_sys_delay_state(env_ids, root_state=root, dof_pos=ref_joint_pos, dof_vel=self.ref_dof_vel[env_ids])
+        self.actions[env_ids] = 0.0
+        self.last_actions[env_ids] = 0.0
+        self.last_last_actions[env_ids] = 0.0
+        self.full_actions[env_ids] = 0.0
+        self.last_full_actions[env_ids] = 0.0
+        self.delayed_full_actions_scaled[env_ids] = 0.0
+        self.last_dof_vel[env_ids] = 0.0
+        self.last_torques[env_ids] = 0.0
+        self.curriculum_episode_length_buf[env_ids] = 0
+        self._clear_external_forces(env_ids)
+        self._update_state_cache(force=True)
+        self._profile_section_end("reset_cleanup", profile_start)
+
+    def _reward_imitation_whole_body_pos(self):
+        cur_body_pos, target_pos, _, _, _, _, _, _ = self._get_tracking_reward_cache()
+        dist_sq = torch.sum(torch.square(cur_body_pos - target_pos), dim=-1).mean(dim=1)
+        return torch.exp(-dist_sq / (self.mrobot_cfg.rewards.sigma.whole_body_pos ** 2))
+
+    def _reward_imitation_whole_body_rot(self):
+        _, _, cur_body_quat, target_quat, _, _, _, _ = self._get_tracking_reward_cache()
+        rot_error = _quat_error_mag_wxyz(cur_body_quat.reshape(-1, 4), target_quat.reshape(-1, 4)).reshape(self.num_envs, -1)
+        return torch.exp(-torch.square(rot_error).mean(dim=-1) / (self.mrobot_cfg.rewards.sigma.whole_body_rot ** 2))
+
+    def _reward_imitation_whole_body_lin_vel(self):
+        _, _, _, _, cur_body_vel, target_vel, _, _ = self._get_tracking_reward_cache()
+        error = torch.sum(torch.square(cur_body_vel - target_vel), dim=-1).mean(dim=-1)
+        return torch.exp(-error / (self.mrobot_cfg.rewards.sigma.whole_body_lin_vel ** 2))
+
+    def _reward_imitation_whole_body_ang_vel(self):
+        _, _, _, _, _, _, cur_body_ang_vel, target_ang_vel = self._get_tracking_reward_cache()
+        error = torch.sum(torch.square(cur_body_ang_vel - target_ang_vel), dim=-1).mean(dim=-1)
+        return torch.exp(-error / (self.mrobot_cfg.rewards.sigma.whole_body_ang_vel ** 2))
+
+    def _reward_imition_root_pos(self):
+        cur_root_pos, _ = self._get_current_anchor_pose_local()
+        diff_sq = torch.sum(torch.square(cur_root_pos - self.ref_waist_pos[:, 0, :]), dim=-1)
+        return torch.exp(-diff_sq / (self.mrobot_cfg.rewards.sigma.root_pos ** 2))
+
+    def _reward_imition_root_rot(self):
+        _, cur_q = self._get_current_anchor_pose()
+        return torch.exp(-_quat_error_mag_wxyz(cur_q, self.ref_waist_quat[:, 0, :]) ** 2 / (self.mrobot_cfg.rewards.sigma.root_rot ** 2))
+
+    def _reward_dof_acc(self):
+        return torch.sum(torch.square((self.last_dof_vel - self.dof_vel) / self.step_dt), dim=1)
+
+    def _reward_action_rate(self):
+        return torch.sum(torch.square(self.last_actions - self.actions), dim=1)
+
+    def _reward_ankle_dof_acc(self):
+        ankle_idx = self.ankle_reward_indices
+        return torch.sum(torch.square((self.last_dof_vel[:, ankle_idx] - self.dof_vel[:, ankle_idx]) / self.step_dt), dim=1)
+
+    def _reward_ankle_dof_vel(self):
+        return torch.sum(torch.square(self.dof_vel[:, self.ankle_reward_indices]), dim=1)
+
+    def _reward_dof_pos_limits(self):
+        dof_pos = self.dof_pos[:, self.num_control]
+        dof_limits = self.dof_pos_limits[:, self.num_control, :]
+        out_of_limits = -(dof_pos - dof_limits[:, :, 0]).clip(max=0.0)
+        out_of_limits += (dof_pos - dof_limits[:, :, 1]).clip(min=0.0)
+        return torch.sum(out_of_limits, dim=1)
+
+    def _reward_torque_limits(self):
+        soft_limit_val = self.torque_limits * 0.9
+        torques_to_check = torch.abs(self.torques[:, self.num_control])
+        relevant_soft_limits = soft_limit_val[self.num_control]
+        over_limit = torques_to_check - relevant_soft_limits
+        violation = torch.clamp(over_limit, min=0.0)
+        reward = torch.mean(violation / (self.torque_limits[self.num_control] * 0.1).clamp(min=1e-6), dim=1)
+        return torch.clamp(reward, min=0.0, max=1.0)
+
+    def _reward_ankle_torque_limit(self):
+        ankle_idx = self.ankle_reward_indices
+        soft_limit_val = self.torque_limits[ankle_idx] * 0.9
+        violation = torch.clamp(torch.abs(self.torques[:, ankle_idx]) - soft_limit_val, min=0.0)
+        reward = torch.mean(violation / (self.torque_limits[ankle_idx] * 0.1).clamp(min=1e-6), dim=1)
+        return torch.clamp(reward, min=0.0, max=1.0)

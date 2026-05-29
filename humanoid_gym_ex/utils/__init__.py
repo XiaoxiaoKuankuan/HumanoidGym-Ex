@@ -30,8 +30,26 @@
 # Copyright (c) 2024 Beijing RobotEra TECHNOLOGY CO.,LTD. All rights reserved.
 
 
-from .helpers import class_to_dict, get_load_path, get_args, export_policy_as_jit, set_seed, update_class_from_dict
-from .task_registry import task_registry
-from .logger import Logger
-from .math import *
-from .terrain import Terrain
+def _isaacgym_unavailable(*args, **kwargs):
+    raise ImportError("IsaacGym helper utilities are unavailable in this import order/session.")
+
+
+try:
+    from .helpers import class_to_dict, get_load_path, get_args, export_policy_as_jit, set_seed, update_class_from_dict
+    from .task_registry import task_registry
+    from .logger import Logger
+    from .math import *
+    from .terrain import Terrain
+except ImportError as exc:
+    if "PyTorch was imported before isaacgym" not in str(exc) and "isaacgym" not in str(exc):
+        raise
+    class_to_dict = _isaacgym_unavailable
+    get_load_path = _isaacgym_unavailable
+    get_args = _isaacgym_unavailable
+    export_policy_as_jit = _isaacgym_unavailable
+    set_seed = _isaacgym_unavailable
+    update_class_from_dict = _isaacgym_unavailable
+    task_registry = None
+    Logger = None
+    Terrain = None
+from .reference_state import JOINT_NAME_ALIASES, ReferenceStateNet, encode_bpm_phase

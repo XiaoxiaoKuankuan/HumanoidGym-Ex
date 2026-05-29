@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from humanoid_gym_ex.algo.vec_env import VecEnv
@@ -10,6 +12,11 @@ class IsaacLabRslRlVecEnv(VecEnv):
 
     def __init__(self, env):
         self.env = env
+        if hasattr(env, "mrobot_cfg"):
+            self.cfg = SimpleNamespace(
+                env=SimpleNamespace(normalize_obs=bool(getattr(env.mrobot_cfg.env, "normalize_obs", False)))
+            )
+            self.num_aux = 0
         self.num_envs = env.num_envs
         self.num_obs = env.cfg.observation_space
         self.num_privileged_obs = env.cfg.state_space
@@ -61,3 +68,8 @@ class IsaacLabRslRlVecEnv(VecEnv):
 
     def close(self):
         return self.env.close()
+
+    def update_domain_rand_curriculum(self, iteration, force=False):
+        if hasattr(self.env, "update_domain_rand_curriculum"):
+            return self.env.update_domain_rand_curriculum(iteration, force=force)
+        return None

@@ -74,3 +74,8 @@ docs/HumanoidGym-Ex_README.html
 # other
 *.egg-info
 __pycache__
+
+# BPM 数据集与评估产物
+BPM_dance/bpm_phase_state_dataset_keypoint/
+reference_state_eval/
+*.csv

@@ -37,9 +37,11 @@ class ActorCritic(nn.Module):
     def __init__(self,  num_actor_obs,
                         num_critic_obs,
                         num_actions,
+                        num_aux=0,
                         actor_hidden_dims=[256, 256, 256],
                         critic_hidden_dims=[256, 256, 256],
                         init_noise_std=1.0,
+                        fixed_std=False,
                         activation = nn.ELU(),
                         **kwargs):
         if kwargs:
@@ -49,6 +51,9 @@ class ActorCritic(nn.Module):
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
+        self.num_aux = int(num_aux or 0)
+        self.fixed_std = fixed_std
+
         # Policy
         actor_layers = []
         actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
@@ -73,11 +78,35 @@ class ActorCritic(nn.Module):
                 critic_layers.append(activation)
         self.critic = nn.Sequential(*critic_layers)
 
+        if self.num_aux > 0:
+            aux_layers = []
+            aux_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
+            aux_layers.append(activation)
+            for l in range(len(actor_hidden_dims)):
+                if l == len(actor_hidden_dims) - 1:
+                    aux_layers.append(nn.Linear(actor_hidden_dims[l], self.num_aux))
+                else:
+                    aux_layers.append(nn.Linear(actor_hidden_dims[l], actor_hidden_dims[l + 1]))
+                    aux_layers.append(activation)
+            self.aux = nn.Sequential(*aux_layers)
+        else:
+            self.aux = None
+
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
+        if self.aux is not None:
+            print(f"AUX MLP: {self.aux}")
 
         # Action noise
-        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        init_std = torch.as_tensor(init_noise_std, dtype=torch.float32)
+        if init_std.numel() == 1:
+            init_std = init_std.repeat(num_actions)
+        elif init_std.numel() != num_actions:
+            raise ValueError(f"init_noise_std must be scalar or length {num_actions}, got {init_std.numel()}")
+        if self.fixed_std:
+            self.register_buffer("std", init_std.clone())
+        else:
+            self.std = nn.Parameter(init_std.clone())
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args = False
@@ -115,6 +144,11 @@ class ActorCritic(nn.Module):
     def act(self, observations, **kwargs):
         self.update_distribution(observations)
         return self.distribution.sample()
+
+    def get_aux(self, observations):
+        if self.aux is None:
+            return None
+        return self.aux(observations)
     
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
