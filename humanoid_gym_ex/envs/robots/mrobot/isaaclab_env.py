@@ -679,6 +679,16 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.num_control = list(cfg.env.num_control)
         self.num_notcontrol = list(cfg.env.num_notcontrol)
         self.ref_num_notcontrol = list(cfg.env.ref_num_notcontrol)
+        self.dof_err_w = torch.tensor(
+            getattr(cfg.rewards, "dof_err_w", [1.0] * len(self.num_control)),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if self.dof_err_w.numel() != len(self.num_control):
+            raise RuntimeError(
+                "MRobot IsaacLab rewards.dof_err_w length mismatch: "
+                f"got {self.dof_err_w.numel()}, expected {len(self.num_control)}"
+            )
         self.canonical_joint_names = list(cfg.init_state.default_joint_angles.keys())
         joint_sim_ids = [self.robot.joint_names.index(name) for name in self.canonical_joint_names]
         self.joint_sim_ids = torch.tensor(joint_sim_ids, dtype=torch.long, device=self.device)
@@ -1887,6 +1897,12 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
                 continue
             self.reward_scales[name] = value * self.step_dt
         self.reward_names = [name for name in self.reward_scales if name != "termination"]
+        missing_rewards = [name for name in self.reward_names if not hasattr(self, "_reward_" + name)]
+        if missing_rewards:
+            raise AttributeError(
+                "MRobot IsaacLab reward functions missing for enabled scales: "
+                + ", ".join("_reward_" + name for name in missing_rewards)
+            )
         self.reward_functions = [getattr(self, "_reward_" + name) for name in self.reward_names]
         self.episode_sums = {name: torch.zeros(self.num_envs, device=self.device) for name in self.reward_scales}
         self.tracking_score_names = [
@@ -2165,6 +2181,22 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
     def _reward_imition_root_rot(self):
         _, cur_q = self._get_current_anchor_pose()
         return torch.exp(-_quat_error_mag_wxyz(cur_q, self.ref_waist_quat[:, 0, :]) ** 2 / (self.mrobot_cfg.rewards.sigma.root_rot ** 2))
+
+    def _reward_imition_joint_pos(self):
+        pos_target = self.ref_dof_pos[:, self.num_control]
+        joint_pos = self.dof_pos[:, self.num_control]
+        diff = joint_pos - pos_target
+        err = torch.sum(self.dof_err_w * torch.square(diff), dim=1)
+        sigma_dof_pos = 0.5
+        return torch.exp(-err / (sigma_dof_pos ** 2))
+
+    def _reward_imition_joint_vel(self):
+        vel_target = self.ref_dof_vel[:, self.num_control].clamp(-10.0, 10.0)
+        joint_vel = self.dof_vel[:, self.num_control]
+        diff = vel_target - joint_vel
+        err = torch.sum(self.dof_err_w * torch.square(diff), dim=1)
+        sigma_dof_vel = 2.0
+        return torch.exp(-err / (sigma_dof_vel ** 2))
 
     def _reward_dof_acc(self):
         return torch.sum(torch.square((self.last_dof_vel - self.dof_vel) / self.step_dt), dim=1)

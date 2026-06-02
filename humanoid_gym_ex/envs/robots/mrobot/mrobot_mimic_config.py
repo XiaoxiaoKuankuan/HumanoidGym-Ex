@@ -442,7 +442,7 @@ class MrobotMimicCfg(LeggedRobotCfg):
         # action scale: target angle = actionScale * action + defaultAngle
         action_scale = 0.25
         # False: default_dof_pos + residual；True: ref_dof + residual（受控关节）
-        use_ref_residual_target = True  # False
+        use_ref_residual_target = False  # False
         # decimation: Number of control action updates @ sim DT per policy DT
         decimation = 10  # 100hz
 
@@ -781,8 +781,8 @@ class MrobotMimicCfg(LeggedRobotCfg):
         # 12 个受控腿部关节的 imitation joint pos/vel 误差权重。
         # 降低脚踝 pitch/roll 权重，避免策略为了死跟踪脚踝角度而用踝关节高频补偿接触扰动。
         dof_err_w = [
-            1.0, 1.0, 1.0, 1.0, 0.3, 0.3,
-            1.0, 1.0, 1.0, 1.0, 0.3, 0.3,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
         ]
 
         class sigma:

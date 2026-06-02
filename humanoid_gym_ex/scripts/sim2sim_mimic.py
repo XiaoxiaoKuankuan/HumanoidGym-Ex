@@ -82,6 +82,13 @@ def load_policy(path):
         return torch.jit.load(path)
 
 
+def resolve_repo_path(path):
+    path = Path(path).expanduser()
+    if path.is_absolute():
+        return path
+    return _PROJECT_ROOT / path
+
+
 # ====================== 参考动作生成网络 ======================
 
 REFERENCE_DOF_POS_COLUMNS = [
@@ -118,6 +125,12 @@ REFERENCE_DOF_POS_COLUMNS = [
 class ReferenceMotionGenerator:
     def __init__(self, model_path, device="cpu"):
         self.device = torch.device(device)
+        model_path = resolve_repo_path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Reference model checkpoint not found: {model_path}. "
+                "Use --reference_model to pass BPM_dance/reference_state_keypoint_model.pt or an absolute checkpoint path."
+            )
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         self.output_columns = list(checkpoint["output_columns"])
         self.column_index = {name: idx for idx, name in enumerate(self.output_columns)}
@@ -652,8 +665,8 @@ def run_mujoco(policy, cfg):
     #                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, \
     #                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, \
     #                                    0.0, 0.0], dtype=np.float64)
-    default_dof_pos_serial = np.array([ -0.440, 0.189, 0.067, 0.833,  -0.350, -0.126, \
-                                       -0.440, -0.189, -0.067, 0.833,  -0.350, 0.126, \
+    default_dof_pos_serial = np.array([ -0.457, 0.192, 0.062, 0.874,  -0.370, -0.126, \
+                                       -0.457, -0.192, -0.062, 0.874,  -0.370, 0.126, \
                                        0.0, \
                                        0.171, 0.327, 0.442, -1.093, 1.257, -0.058,  -1.514, \
                                        -0.149, -0.755, 0.306, -1.865, 0.258, 0.155, 1.073, \
@@ -669,7 +682,7 @@ def run_mujoco(policy, cfg):
     reference_model_path = getattr(
         cfg.sim_config,
         "reference_model_path",
-        f"{LEGGED_GYM_ROOT_DIR}/deploy/reference_state_keypoint_model.pt",
+        f"{LEGGED_GYM_ROOT_DIR}/BPM_dance/reference_state_keypoint_model.pt",
     )
     reference_generator = ReferenceMotionGenerator(reference_model_path)
     print(f"[sim2sim_mimic] 已加载参考动作生成网络: {reference_model_path}")
@@ -1177,7 +1190,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--reference_model',
         type=str,
-        default=f'{LEGGED_GYM_ROOT_DIR}/deploy/reference_state_keypoint_model.pt',
+        default=f'{LEGGED_GYM_ROOT_DIR}/BPM_dance/reference_state_keypoint_model.pt',
         help='Path to reference motion generator checkpoint',
     )
     args = parser.parse_args()
@@ -1189,7 +1202,7 @@ if __name__ == '__main__':
             else:
                 # mujoco_model_path = f'{LEGGED_GYM_ROOT_DIR}/resources/robots/CASBOT02_ENCOS_7dof_shell_20251015/Serial/xml/CASBOT_02_shell_ENCOS_7dof_par.xml'
                 mujoco_model_path = f'{LEGGED_GYM_ROOT_DIR}/resources/robots/CASBOT02_ENCOS_7dof_shell_20251015/Serial/xml/CASBOT_02_shell_ENCOS_7dof_par_bass.xml'  # bass
-            sim_duration = 15.0
+            sim_duration = 95.0
             dt = 0.001
             decimation = 10
             action_delay = 0
