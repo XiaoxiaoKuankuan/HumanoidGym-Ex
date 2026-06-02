@@ -1587,7 +1587,9 @@ class LeggedRobot(BaseTask):
         self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
                              for name in self.reward_scales.keys()}
         self.tracking_score_names = [
-            name for name in self.reward_names if name.startswith("imitation") or name.startswith("imition")
+            name
+            for name in self.reward_names
+            if name.startswith("imitation") or name.startswith("imition") or name == "teleop_contact_mask"
         ]
         self.tracking_score_sums = {
             name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)

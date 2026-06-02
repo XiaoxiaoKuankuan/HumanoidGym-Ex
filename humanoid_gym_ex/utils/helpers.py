@@ -32,11 +32,14 @@
 import datetime
 import os
 import copy
-import torch
 import numpy as np
 import random
+
+# Isaac Gym must be imported before PyTorch in every process.
 from isaacgym import gymapi
 from isaacgym import gymutil
+
+import torch
 
 from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 
@@ -171,6 +174,8 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             env_cfg.motion.reference_model_path = args.reference_model
         if hasattr(args, "fixed_bpm") and args.fixed_bpm is not None and hasattr(env_cfg, "motion"):
             env_cfg.motion.fixed_bpm = args.fixed_bpm
+        if hasattr(args, "motion_files") and args.motion_files is not None and hasattr(env_cfg, "motion"):
+            env_cfg.motion.files = [item.strip() for item in args.motion_files.split(",") if item.strip()]
     if cfg_train is not None:
         if args.seed is not None:
             cfg_train.seed = args.seed
@@ -284,6 +289,11 @@ def get_args():
             "name": "--fixed_bpm",
             "type": float,
             "help": "Use a fixed BPM command for BPM mimic tasks. Overrides cfg.motion.fixed_bpm.",
+        },
+        {
+            "name": "--motion_files",
+            "type": str,
+            "help": "Comma-separated .npz files for trajectory mimic tasks. Overrides cfg.motion.files.",
         },
     ]
     # parse arguments

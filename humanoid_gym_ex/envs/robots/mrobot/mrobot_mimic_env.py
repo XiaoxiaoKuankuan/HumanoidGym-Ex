@@ -591,6 +591,19 @@ class MrobotMimicEnv(LeggedRobot):
         pred = self._predict_reference_state()
         self._split_reference_prediction(pred)
 
+    def _get_actor_reference_extra_obs(self):
+        return torch.cat(
+            (
+                torch.sin(self.phase_rad),
+                torch.cos(self.phase_rad),
+                self.normalized_bpm_cmd,
+            ),
+            dim=-1,
+        )
+
+    def _get_privileged_reference_phase_obs(self, norm_phase):
+        return norm_phase
+
     def _get_current_demo_lengths(self):
         return self.demo_lengths[self.ref_idx]
 
@@ -704,8 +717,6 @@ class MrobotMimicEnv(LeggedRobot):
     def compute_observations(self):
         self.compute_ref_state()
         norm_phase = self.phase_rad / (2.0 * torch.pi)
-        phase_sin = torch.sin(self.phase_rad)
-        phase_cos = torch.cos(self.phase_rad)
         
         anchor_pos_w, anchor_quat_w = self._get_current_anchor_pose()
         anchor_pos_local, _ = self._get_current_anchor_pose_local()
@@ -835,7 +846,7 @@ class MrobotMimicEnv(LeggedRobot):
             (self.payload - self.cfg.domain_rand.payload_mass_range[0]) / (self.cfg.domain_rand.payload_mass_range[1] - self.cfg.domain_rand.payload_mass_range[0]), # 1
             self.com_displacement * self.obs_scales.com_pos, # 3
             ref_foot_contact_curr,  # 2：左/右脚参考抬脚（1=抬脚，0=不抬脚）
-            norm_phase, # 1
+            self._get_privileged_reference_phase_obs(norm_phase), # 1
         ), dim=-1)  # 146
         
         if self.cfg.domain_rand.sys_delay:
@@ -865,9 +876,7 @@ class MrobotMimicEnv(LeggedRobot):
             self.actions[:, self.num_control],   # 12D
             base_ang_vel_ * self.obs_scales.ang_vel,  # 3
             obs_euler_xyz * self.obs_scales.quat,  # 3
-            phase_sin,
-            phase_cos,
-            self.normalized_bpm_cmd,
+            self._get_actor_reference_extra_obs(),
         ), dim=-1)
 
         

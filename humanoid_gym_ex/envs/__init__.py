@@ -35,11 +35,11 @@ _registration_error = None
 
 
 def register_tasks():
+    """Register Isaac Gym tasks. Call from train/play after isaacgym is imported."""
     global task_registry, _registration_error
-    global LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
     global LeggedRobot, XBotLCfg, XBotLCfgPPO, XBotLFreeEnv
     global MrobotMimicCfg, MrobotMimicCfgPPO, MrobotMimicEnv
-    from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
+    global MrobotMimicDanceGymCfg, MrobotMimicDanceGymCfgPPO, MrobotMimicDanceEnv
     from .base.legged_robot import LeggedRobot
     from .robots.humanoid_config import XBotLCfg, XBotLCfgPPO
     from .robots.humanoid_env import XBotLFreeEnv
@@ -47,29 +47,13 @@ def register_tasks():
     MrobotMimicCfg = MrobotMimicGymCfg
     MrobotMimicCfgPPO = MrobotMimicGymCfgPPO
     from .robots.mrobot.mrobot_mimic_env import MrobotMimicEnv
-    from humanoid_gym_ex.utils.task_registry import task_registry
+    from .robots.mrobot.mrobot_mimic_dance_config_gym import MrobotMimicDanceGymCfg, MrobotMimicDanceGymCfgPPO
+    from .robots.mrobot.mrobot_mimic_dance_env import MrobotMimicDanceEnv
+    from humanoid_gym_ex.utils.task_registry import task_registry as registry
 
-    task_registry.register("humanoid_ppo", XBotLFreeEnv, XBotLCfg(), XBotLCfgPPO())
-    task_registry.register("mrobot_music", MrobotMimicEnv, MrobotMimicGymCfg(), MrobotMimicGymCfgPPO())
+    registry.register("humanoid_ppo", XBotLFreeEnv, XBotLCfg(), XBotLCfgPPO())
+    registry.register("mrobot_music", MrobotMimicEnv, MrobotMimicGymCfg(), MrobotMimicGymCfgPPO())
+    registry.register("mrobot_dance", MrobotMimicDanceEnv, MrobotMimicDanceGymCfg(), MrobotMimicDanceGymCfgPPO())
+    task_registry = registry
     _registration_error = None
-    return task_registry
-
-
-try:
-    register_tasks()
-except ModuleNotFoundError as exc:
-    if exc.name != "isaacgym":
-        raise
-    _registration_error = exc
-    task_registry = None
-except ImportError as exc:
-    if "PyTorch was imported before isaacgym" not in str(exc):
-        raise
-    _registration_error = exc
-    task_registry = None
-except OSError as exc:
-    # IsaacGym's gymtorch extension may try to build in a read-only cache during
-    # static CLI usage. Keep config-only imports available; simulator entrypoints
-    # will still fail loudly when they actually need IsaacGym.
-    _registration_error = exc
-    task_registry = None
+    return registry

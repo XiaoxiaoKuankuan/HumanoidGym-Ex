@@ -29,10 +29,11 @@
 #
 # Copyright (c) 2024 Beijing RobotEra TECHNOLOGY CO.,LTD. All rights reserved.
 
-import torch
-from torch import Tensor
 import numpy as np
 from isaacgym.torch_utils import quat_apply, normalize
+
+import torch
+from torch import Tensor
 from typing import Tuple
 
 # @ torch.jit.script

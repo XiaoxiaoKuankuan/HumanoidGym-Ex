@@ -17,13 +17,14 @@ import torch
 from isaaclab.app import AppLauncher
 
 
-parser = argparse.ArgumentParser(description="Train MRobot BPM mimic in IsaacLab Direct workflow.")
-parser.add_argument("--task", type=str, default="mrobot_music", choices=["mrobot_music"], help="Compatibility task name.")
+parser = argparse.ArgumentParser(description="Train MRobot mimic tasks in IsaacLab Direct workflow.")
+parser.add_argument("--task", type=str, default="mrobot_music", choices=["mrobot_music", "mrobot_dance"], help="MRobot task name.")
 parser.add_argument("--num_envs", type=int, default=None)
 parser.add_argument("--max_iterations", type=int, default=None)
 parser.add_argument("--num_steps_per_env", type=int, default=None)
 parser.add_argument("--experiment_name", type=str, default=None)
 parser.add_argument("--reference_model", type=str, default=None)
+parser.add_argument("--motion_files", type=str, default=None, help="Comma-separated .npz files for --task mrobot_dance.")
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--run_name", type=str, default=None)
 parser.add_argument("--no_log", action="store_true")
@@ -54,7 +55,16 @@ simulation_app = app_launcher.app
 
 from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR  # noqa: E402
 from humanoid_gym_ex.algo.ppo.on_policy_runner import OnPolicyRunner  # noqa: E402
-from humanoid_gym_ex.envs.robots.mrobot.isaaclab_env import MrobotMimicIsaacLabEnv, MrobotMimicIsaacLabEnvCfg  # noqa: E402
+from humanoid_gym_ex.envs.robots.mrobot.isaaclab_env import (  # noqa: E402
+    MrobotMimicDanceIsaacLabEnv,
+    MrobotMimicDanceIsaacLabEnvCfg,
+    MrobotMimicIsaacLabEnv,
+    MrobotMimicIsaacLabEnvCfg,
+)
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config_lab import (  # noqa: E402
+    MrobotMimicDanceLabCfg,
+    MrobotMimicDanceLabCfgPPO,
+)
 from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config_lab import MrobotMimicLabCfg, MrobotMimicLabCfgPPO  # noqa: E402
 from humanoid_gym_ex.envs.robots.xbot.isaaclab_vec_env import IsaacLabRslRlVecEnv  # noqa: E402
 
@@ -99,13 +109,21 @@ def save_training_config(log_dir, train_cfg):
 
 def main():
     os.environ.setdefault("WANDB_MODE", "offline")
-    train_cfg = MrobotMimicLabCfgPPO()
+    if args_cli.task == "mrobot_dance":
+        train_cfg = MrobotMimicDanceLabCfgPPO()
+        env_cfg = MrobotMimicDanceIsaacLabEnvCfg()
+        env_class = MrobotMimicDanceIsaacLabEnv
+        cfg_class = MrobotMimicDanceLabCfg
+    else:
+        train_cfg = MrobotMimicLabCfgPPO()
+        env_cfg = MrobotMimicIsaacLabEnvCfg()
+        env_class = MrobotMimicIsaacLabEnv
+        cfg_class = MrobotMimicLabCfg
     if args_cli.seed is not None:
         train_cfg.seed = args_cli.seed
     seed = set_seed(train_cfg.seed)
-    env_cfg = MrobotMimicIsaacLabEnvCfg()
     env_cfg.seed = seed
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else MrobotMimicLabCfg.env.num_envs
+    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else cfg_class.env.num_envs
     env_cfg.sim.device = args_cli.device
     env_cfg.disable_domain_randomization = args_cli.disable_domain_randomization
     env_cfg.deterministic_reset = args_cli.deterministic_reset
@@ -114,8 +132,10 @@ def main():
     env_cfg.profile_step_timing_warmup = args_cli.profile_step_timing_warmup
     if args_cli.reference_model is not None:
         env_cfg.reference_model_path = args_cli.reference_model
+    if args_cli.motion_files is not None:
+        env_cfg.motion_files = [item.strip() for item in args_cli.motion_files.split(",") if item.strip()]
 
-    direct_env = MrobotMimicIsaacLabEnv(env_cfg)
+    direct_env = env_class(env_cfg)
     vec_env = IsaacLabRslRlVecEnv(direct_env)
     vec_env.num_policy_actions = env_cfg.action_space
 

@@ -35,7 +35,7 @@ from tqdm import tqdm
 from collections import deque
 from scipy.spatial.transform import Rotation as R
 from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
-from humanoid_gym_ex.envs import XBotLCfg
+from humanoid_gym_ex.envs.robots.humanoid_config import XBotLCfg
 import torch
 
 

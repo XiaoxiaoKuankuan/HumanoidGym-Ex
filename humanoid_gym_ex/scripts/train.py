@@ -36,8 +36,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import humanoid_gym_ex.envs as envs_module
+# Isaac Gym must load before PyTorch (see isaacgym/gymdeps.py).
+import isaacgym  # noqa: F401
+
 from humanoid_gym_ex.utils import get_args
+import humanoid_gym_ex.envs as envs_module
 
 def train(args):
     task_registry = envs_module.register_tasks()

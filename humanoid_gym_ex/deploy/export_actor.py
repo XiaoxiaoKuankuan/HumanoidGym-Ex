@@ -132,7 +132,7 @@ import importlib.util
 import numpy as np
 
 # 从 checkpoint 导出时用的配置（与 humanoid/envs/custom/mrobot_mimic_config.py 保持一致，避免 import humanoid.envs 触发 isaacgym）
-MRobot_MIMIC_CONFIG = {
+MROBOT_MUSIC_CONFIG = {
     "num_observations": 45 + 19,
     "num_privileged_obs": 45 + 146 + 19,
     "num_control": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
@@ -144,8 +144,24 @@ MRobot_MIMIC_CONFIG = {
     # "critic_hidden_dims": [768, 256, 128],
 }
 
+MROBOT_DANCE_CONFIG = {
+    "num_observations": 42 + 19,
+    "num_privileged_obs": 45 + 146 + 19,
+    "num_control": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "num_aux": 9,
+    "num_single_obs": 42,
+    "num_goal_obs": 19,
+    "actor_hidden_dims": [512, 256, 128],
+    "critic_hidden_dims": [512, 256, 128],
+}
+
+TASK_CONFIGS = {
+    "mrobot_music": MROBOT_MUSIC_CONFIG,
+    "mrobot_dance": MROBOT_DANCE_CONFIG,
+}
+
 # 观测维度
-NUM_OBS = MRobot_MIMIC_CONFIG["num_observations"]
+NUM_OBS = MROBOT_MUSIC_CONFIG["num_observations"]
 
 
 # ==========================================
@@ -202,7 +218,7 @@ class PolicyWithNormalizer(nn.Module):
 # ==========================================
 # 2. 仅用训练 checkpoint 一步导出 ONNX（推荐：无需先跑 play 导 JIT）
 # ==========================================
-def export_onnx_from_ckpt(ckpt_path, output_path):
+def export_onnx_from_ckpt(ckpt_path, output_path, task="mrobot_music"):
     """
     从训练保存的 model_XXX.pt 直接导出 ONNX，自动带归一化（若 checkpoint 中有 obs_normalizer）。
     只需一个路径，无需先导出 JIT。
@@ -215,7 +231,7 @@ def export_onnx_from_ckpt(ckpt_path, output_path):
         print("错误: checkpoint 中无 model_state_dict，请使用训练保存的 .pt 文件")
         return
 
-    cfg = MRobot_MIMIC_CONFIG
+    cfg = TASK_CONFIGS[task]
     num_obs = cfg["num_observations"]
     num_privileged_obs = cfg["num_privileged_obs"]
     num_actions = len(cfg["num_control"])
@@ -245,14 +261,14 @@ def export_onnx_from_ckpt(ckpt_path, output_path):
 
     if "obs_normalizer" in ckpt:
         print("从 checkpoint 加载观测归一化，ONNX 将包含归一化 (输入为 raw obs)")
-        normalizer = NormalizerModule(shape=NUM_OBS)
+        normalizer = NormalizerModule(shape=num_obs)
         normalizer.load_from_empirical_state_dict(ckpt["obs_normalizer"])
         deploy_model = PolicyWithNormalizer(normalizer, deploy_model)
         deploy_model.eval()
     else:
         print("checkpoint 中无 obs_normalizer，导出不含归一化")
 
-    dummy_input = torch.randn(1, NUM_OBS, device="cpu")
+    dummy_input = torch.randn(1, num_obs, device="cpu")
     try:
         with torch.no_grad():
             test_out = deploy_model(dummy_input)
@@ -277,7 +293,7 @@ def export_onnx_from_ckpt(ckpt_path, output_path):
 # ==========================================
 # 3. 从 JIT 导出（兼容旧流程，可选 ckpt 只做归一化）
 # ==========================================
-def export_onnx(jit_path, output_path, ckpt_path=None):
+def export_onnx(jit_path, output_path, ckpt_path=None, task="mrobot_music"):
     """
     jit_path: 已导出的 JIT policy (encoder+actor)
     output_path: 输出的 ONNX 路径
@@ -301,7 +317,7 @@ def export_onnx(jit_path, output_path, ckpt_path=None):
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         if "obs_normalizer" in ckpt:
             print(f"从 checkpoint 加载观测归一化参数: {ckpt_path}")
-            normalizer = NormalizerModule(shape=NUM_OBS)
+            normalizer = NormalizerModule(shape=TASK_CONFIGS[task]["num_observations"])
             normalizer.load_from_empirical_state_dict(ckpt["obs_normalizer"])
             deploy_model = PolicyWithNormalizer(normalizer, deploy_model)
             deploy_model.eval()
@@ -312,8 +328,9 @@ def export_onnx(jit_path, output_path, ckpt_path=None):
         if ckpt_path:
             print(f"未找到 checkpoint 或未指定: {ckpt_path}，导出不含归一化")
 
-    dummy_input = torch.randn(1, NUM_OBS, device='cpu')
-    print(f"开始导出 ONNX (输入维度: {NUM_OBS})...")
+    num_obs = TASK_CONFIGS[task]["num_observations"]
+    dummy_input = torch.randn(1, num_obs, device='cpu')
+    print(f"开始导出 ONNX (task={task}, 输入维度: {num_obs})...")
 
     try:
         with torch.no_grad():
@@ -347,13 +364,15 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", type=str,
                         default=os.path.join(os.path.dirname(__file__), "casbot_mimic.onnx"),
                         help="输出 ONNX 路径")
+    parser.add_argument("--task", type=str, default="mrobot_music", choices=sorted(TASK_CONFIGS.keys()),
+                        help="导出任务配置。mrobot_music 输入 64 维；mrobot_dance 输入 61 维。")
     args = parser.parse_args()
 
     if args.ckpt_path and not args.jit_path:
         # 推荐：只给训练 .pt，一步导出 ONNX（无需先 play 导 JIT）
-        export_onnx_from_ckpt(args.ckpt_path, args.output)
+        export_onnx_from_ckpt(args.ckpt_path, args.output, task=args.task)
     elif args.jit_path:
-        export_onnx(args.jit_path, args.output, args.ckpt_path)
+        export_onnx(args.jit_path, args.output, args.ckpt_path, task=args.task)
     else:
         print("请至少指定 --ckpt_path（推荐）或 --jit_path。")
         print("示例: python deploy/export_actor.py --ckpt_path logs/mrobot_mimic/xxx/model_1000.pt -o deploy/casbot.onnx")
