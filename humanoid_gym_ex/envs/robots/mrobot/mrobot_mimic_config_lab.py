@@ -149,7 +149,7 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
     class asset(MrobotMimicCfg.asset):
         file = (
             "{LEGGED_GYM_ROOT_DIR}/resources/robots/CASBOT02_ENCOS_7dof_shell_20251015/"
-            "Serial/urdf/CASBOT02_ENCOS_7dof_shell_20251015_bass.urdf"
+            "Serial/urdf/CASBOT02_ENCOS_7dof_shell_20251015_guitar.urdf"
         )
         base_name = "base_link"
         fix_base_link = False

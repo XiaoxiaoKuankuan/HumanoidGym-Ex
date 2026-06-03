@@ -31,8 +31,8 @@ from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
 
 DATA_DT = 0.01
 CLEAN_INITIAL_COPY_SOURCE_FRAME = 2
-DEFAULT_INPUT_DIR = "/home/weil/hl_rl/hl_rl/humanoid/ref_pos"
-DEFAULT_OUTPUT_DIR = "/home/weil/hl_rl/hl_rl/humanoid/ref_pos"
+DEFAULT_INPUT_DIR = "/home/weil/HumanoidGym-Ex/ref_pos"
+DEFAULT_OUTPUT_DIR = "/home/weil/HumanoidGym-Ex/ref_pos"
 DEFAULT_FILES = [
     "yellowdongtai_casbot02-guitar2_6R7R2R1R_hand01_whole_100hz_v1.data",
     "yellowdongtai_casbot02-bass1_6R7R2R1R_hand01_whole_100hz_v1.data",
@@ -436,3 +436,6 @@ if __name__ == "__main__":
         record_dance_keypoints(args_cli)
     finally:
         simulation_app.close()
+
+
+# python humanoid_gym_ex/scripts/record_dance_keypoints_lab.py file /home/weil/HumanoidGym-Ex/ref_pos/BS_GuangHuiSuiYue_DongTai_100HZ.data \

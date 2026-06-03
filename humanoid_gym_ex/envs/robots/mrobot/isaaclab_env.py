@@ -2436,8 +2436,41 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         drag_force = (contact_force_z - 20.0).clamp(min=0.0) * ref_lift
         return reward - 0.01 * drag_force.mean(dim=-1)
 
+    def _reward_foot_slip(self):
+        if len(self.feet_contact_indices) != 2 or len(self.feet_indices) != 2:
+            return torch.zeros(self.num_envs, device=self.device)
+        contact = self.contact_forces[:, self.feet_contact_indices, 2] > 20.0
+        foot_speed_xy = torch.norm(self.rigid_state[:, self.feet_indices, 7:9], dim=2)
+        return torch.sum(torch.sqrt(foot_speed_xy.clamp(min=0.0)) * contact.float(), dim=1)
+
+    def _reward_pre_landing_foot_z_vel(self):
+        if len(self.feet_contact_indices) != 2 or len(self.feet_indices) != 2:
+            return torch.zeros(self.num_envs, device=self.device)
+        ref_swing = 1.0 - self.ref_feet_contact.float()
+        contact_force_z = self.contact_forces[:, self.feet_contact_indices, 2]
+        no_contact = (contact_force_z < 5.0).float()
+        foot_z = self.rigid_state[:, self.feet_indices, 2]
+        near_ground = ((foot_z > 0.055) & (foot_z < 0.12)).float()
+        foot_vel_z = self.rigid_state[:, self.feet_indices, 9]
+        downward_vel_excess = torch.clamp(-foot_vel_z - 0.15, min=0.0)
+        pre_landing_mask = ref_swing * no_contact * near_ground
+        return torch.sum(torch.square(downward_vel_excess) * pre_landing_mask, dim=1)
+
+    def _reward_feet_contact_forces(self):
+        if len(self.feet_contact_indices) != 2:
+            return torch.zeros(self.num_envs, device=self.device)
+        max_contact_force = float(getattr(self.mrobot_cfg.rewards, "max_contact_force", 600.0))
+        foot_contact_force = torch.norm(self.contact_forces[:, self.feet_contact_indices, :], dim=-1)
+        return torch.sum((foot_contact_force - max_contact_force).clip(min=0.0, max=5000.0), dim=1)
+
+    def _reward_torques(self):
+        return torch.sum(torch.square(self.torques[:, self.num_control]), dim=1)
+
+    def _reward_dof_vel(self):
+        return torch.sum(torch.square(self.dof_vel[:, self.num_control]), dim=1)
+
     def _reward_dof_acc(self):
-        return torch.sum(torch.square((self.last_dof_vel - self.dof_vel) / self.step_dt), dim=1)
+        return torch.sum(torch.square((self.last_dof_vel[:, self.num_control] - self.dof_vel[:, self.num_control]) / self.step_dt), dim=1)
 
     def _reward_action_rate(self):
         return torch.sum(torch.square(self.last_actions - self.actions), dim=1)
