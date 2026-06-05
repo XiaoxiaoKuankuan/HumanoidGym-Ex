@@ -133,6 +133,29 @@ def _resolve_reference_model_path(path):
     return path if os.path.isabs(path) else os.path.join(LEGGED_GYM_ROOT_DIR, path)
 
 
+def _matched_control_decimation(mrobot_cfg_cls):
+    """Return the control decimation, optionally matched to trajectory FPS."""
+    decimation = int(getattr(mrobot_cfg_cls.control, "decimation", 1))
+    if not bool(getattr(mrobot_cfg_cls.control, "match_reference_fps", False)):
+        return max(1, decimation)
+    reference_fps = float(getattr(mrobot_cfg_cls.motion, "reference_fps", 0.0))
+    sim_dt = float(getattr(mrobot_cfg_cls.sim, "dt", 0.0))
+    if reference_fps <= 0.0 or sim_dt <= 0.0:
+        return max(1, decimation)
+    raw_decimation = 1.0 / (reference_fps * sim_dt)
+    matched = max(1, int(round(raw_decimation)))
+    if not math.isclose(raw_decimation, float(matched), rel_tol=0.0, abs_tol=1e-6):
+        print(
+            "[HumanoidGym-Ex][WARN] MRobot reference FPS does not divide sim.dt exactly: "
+            f"reference_fps={reference_fps}, sim_dt={sim_dt}, raw_decimation={raw_decimation:.6f}, "
+            f"using decimation={matched}",
+            flush=True,
+        )
+    # Keep the runtime mrobot cfg and DirectRLEnv cfg aligned.
+    mrobot_cfg_cls.control.decimation = matched
+    return matched
+
+
 def _isaaclab_default_joint_angles(mrobot_cfg_cls=MrobotMimicBPMLabCfg):
     joint_angles = dict(mrobot_cfg_cls.init_state.default_joint_angles)
     # IsaacLab validates URDF limits during articulation initialization.  The
@@ -160,6 +183,7 @@ class MrobotMimicIsaacLabEnvCfg(DirectRLEnvCfg):
     profile_step_timings = False
     profile_step_timing_interval = 200
     profile_step_timing_warmup = 20
+    num_steps_per_env = None
 
     sim: SimulationCfg = SimulationCfg(
         dt=MrobotMimicCfg.sim.dt,
@@ -238,7 +262,7 @@ class MrobotMimicIsaacLabEnvCfg(DirectRLEnvCfg):
 @configclass
 class MrobotMimicDanceIsaacLabEnvCfg(MrobotMimicIsaacLabEnvCfg):
     episode_length_s = MrobotMimicDanceLabCfg.env.episode_length_s
-    decimation = MrobotMimicDanceLabCfg.control.decimation
+    decimation = _matched_control_decimation(MrobotMimicDanceLabCfg)
     action_scale = MrobotMimicDanceLabCfg.control.action_scale
     action_space = MrobotMimicDanceLabCfg.env.num_policy_actions
     observation_space = MrobotMimicDanceLabCfg.env.num_observations
@@ -299,7 +323,7 @@ class MrobotMimicDanceIsaacLabEnvCfg(MrobotMimicIsaacLabEnvCfg):
     contact_sensor: ContactSensorCfg = ContactSensorCfg(
         prim_path="/World/envs/env_.*/Robot/.*(base_link|waist_yaw_link|pelvic_yaw_link|knee_pitch_link|ankle_roll_link)",
         history_length=1,
-        update_period=MrobotMimicDanceLabCfg.sim.dt * MrobotMimicDanceLabCfg.control.decimation,
+        update_period=MrobotMimicDanceLabCfg.sim.dt * decimation,
         track_air_time=False,
     )
 
@@ -379,7 +403,10 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             return
         ordered_names = [
             "pre_physics_step",
+            "noncontrolled_ref_action",
             "apply_action",
+            "action_filter",
+            "action_delay",
             "write_data_to_sim",
             "sim_step",
             "render",
@@ -394,6 +421,7 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             "rewards",
             "reset",
             "reset_episode_logging",
+            "reset_adaptive_sampling",
             "reset_robot_super",
             "reset_bpm_ref",
             "reset_domain_rand",
@@ -401,10 +429,12 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             "reset_cleanup",
             "events",
             "observations",
+            "reference_update",
             "obs_noise",
             "state_root_joint",
             "state_base_vel",
             "state_body",
+            "state_cache",
             "total",
         ]
         pieces = []
@@ -414,6 +444,15 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         print(
             "[MRobot IsaacLab profile] avg per env.step over "
             f"{interval} steps: " + ", ".join(pieces),
+            flush=True,
+        )
+        num_steps_per_env = getattr(self.cfg, "num_steps_per_env", None)
+        physics_substeps = None if num_steps_per_env is None else int(num_steps_per_env) * int(self.cfg.decimation)
+        print(
+            "[MRobot IsaacLab profile cfg] "
+            f"num_steps_per_env={num_steps_per_env}, decimation={self.cfg.decimation}, "
+            f"physics_substeps_per_rollout={physics_substeps}, policy_dt={self.step_dt:.6f}, "
+            f"max_episode_length_steps={self.max_episode_length}",
             flush=True,
         )
         self._profile_accum.clear()
@@ -561,6 +600,19 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             print(
                 "[HumanoidGym-Ex] MRobot Dance motion files: "
                 + ", ".join([str(path) for path in getattr(self, "motion_files", [])]),
+                flush=True,
+            )
+            reference_fps = float(getattr(self.mrobot_cfg.motion, "reference_fps", 0.0))
+            expected_reference_dt = 1.0 / reference_fps if reference_fps > 0.0 else float("nan")
+            num_steps_per_env = getattr(self.cfg, "num_steps_per_env", None)
+            physics_substeps = None if num_steps_per_env is None else int(num_steps_per_env) * int(self.cfg.decimation)
+            print(
+                "[HumanoidGym-Ex] MRobot Dance timing: "
+                f"sim.dt={self.cfg.sim.dt}, control.decimation={self.cfg.decimation}, "
+                f"policy_dt={self.step_dt:.6f}, reference_fps={reference_fps:g}, "
+                f"expected_reference_dt={expected_reference_dt:.6f}, "
+                f"physics_substeps_per_rollout={physics_substeps}, "
+                f"max_episode_length_steps={self.max_episode_length}",
                 flush=True,
             )
         print(
@@ -1055,7 +1107,14 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.next_push_step = self.common_step_counter + self._sample_push_interval_steps()
         self.disturbance_interval = max(1, math.ceil(float(cfg.domain_rand.disturbance_s) / self.step_dt))
         self.fall_reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.contact_reset_buf = torch.zeros_like(self.fall_reset_buf)
+        self.base_too_low_buf = torch.zeros_like(self.fall_reset_buf)
         self.ref_end_reset_buf = torch.zeros_like(self.fall_reset_buf)
+        self.tracking_error_reset_buf = torch.zeros_like(self.fall_reset_buf)
+        self.waist_z_bad_buf = torch.zeros_like(self.fall_reset_buf)
+        self.waist_ori_bad_buf = torch.zeros_like(self.fall_reset_buf)
+        self.foot_z_bad_buf = torch.zeros_like(self.fall_reset_buf)
+        self.adaptive_phase_failure_buf = torch.zeros_like(self.fall_reset_buf)
         self.curriculum_episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._init_domain_rand_curriculum_buffers()
         self._apply_substep = 0
@@ -1065,6 +1124,16 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.policy_obs_buf = torch.zeros(self.num_envs, cfg.env.num_observations, device=self.device)
         self.privileged_obs_buf = torch.zeros(self.num_envs, cfg.env.num_privileged_obs, device=self.device)
         self.priv_curr_buf = torch.zeros(self.num_envs, 146, device=self.device)
+        self.gravity_vec = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32, device=self.device).repeat(self.num_envs, 1)
+        self.motion_bin_size_frames = 1
+        self.motion_num_bins = torch.ones(1, dtype=torch.long, device=self.device)
+        self.motion_valid_bin_mask = torch.ones(1, 1, dtype=torch.bool, device=self.device)
+        self.motion_bin_failed_count = torch.zeros(1, 1, device=self.device)
+        self._current_motion_bin_failed = torch.zeros_like(self.motion_bin_failed_count)
+        self.motion_sampling_prob = torch.ones_like(self.motion_bin_failed_count)
+        self.motion_sampling_entropy = torch.ones((), device=self.device)
+        self.motion_sampling_top1_prob = torch.ones((), device=self.device)
+        self.motion_sampling_top1_bin = torch.zeros((), device=self.device)
         self._state_cache_common_step = -1
         self._state_cache_valid = False
 
@@ -1611,10 +1680,19 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.waist_vel_buffer = buffers["waist_vel"]
         self.waist_quat_buffer = _quat_xyzw_to_wxyz(buffers["waist_quat"])
         self.waist_ang_vel_buffer = buffers["waist_ang_vel"]
+        self._init_adaptive_phase_sampling()
         print("[mrobot_dance][IsaacLab] 指定轨迹 reference 加载完成", flush=True)
         print(f"[mrobot_dance][IsaacLab] 轨迹数量: {self.data_length}", flush=True)
         print(
             f"[mrobot_dance][IsaacLab] 各轨迹真实长度: {[int(x) for x in self.demo_lengths.detach().cpu().tolist()]}",
+            flush=True,
+        )
+        print(
+            "[mrobot_dance][IsaacLab] adaptive phase sampling: "
+            f"enabled={getattr(motion_cfg, 'use_adaptive_phase_sampling', False)}, "
+            f"reference_fps={getattr(motion_cfg, 'reference_fps', None)}, "
+            f"bin_size_frames={self.motion_bin_size_frames}, "
+            f"num_bins={[int(x) for x in self.motion_num_bins.detach().cpu().tolist()]}",
             flush=True,
         )
 
@@ -1783,12 +1861,114 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             return torch.zeros_like(self.phase_rad)
         return self.phase_rad / (2.0 * math.pi)
 
-    def _sample_trajectory_phase_starts(self, ref_ids):
+    def _init_adaptive_phase_sampling(self):
+        motion = self.mrobot_cfg.motion
+        reference_fps = float(getattr(motion, "reference_fps", 1.0))
+        bin_size_sec = float(getattr(motion, "adaptive_bin_size_sec", 1.0))
+        self.motion_bin_size_frames = max(1, int(round(reference_fps * bin_size_sec)))
+        self.motion_num_bins = torch.ceil(self.demo_lengths.float() / float(self.motion_bin_size_frames)).long().clamp(min=1)
+        max_bins = int(torch.max(self.motion_num_bins).item())
+        bin_ids = torch.arange(max_bins, dtype=torch.long, device=self.device).unsqueeze(0)
+        self.motion_valid_bin_mask = bin_ids < self.motion_num_bins.unsqueeze(1)
+        self.motion_bin_failed_count = torch.zeros(self.data_length, max_bins, device=self.device)
+        self._current_motion_bin_failed = torch.zeros_like(self.motion_bin_failed_count)
+        self.motion_sampling_prob = torch.zeros_like(self.motion_bin_failed_count)
+        self.motion_sampling_entropy = torch.ones((), device=self.device)
+        self.motion_sampling_top1_prob = torch.zeros((), device=self.device)
+        self.motion_sampling_top1_bin = torch.zeros((), device=self.device)
+        self._refresh_motion_sampling_prob()
+
+    def _refresh_motion_sampling_prob(self):
+        if not self._uses_trajectory_reference():
+            return
+        motion = self.mrobot_cfg.motion
+        valid = self.motion_valid_bin_mask
+        num_valid = self.motion_num_bins.float().clamp(min=1.0)
+        uniform = valid.float() / num_valid.unsqueeze(1)
+        counts = self.motion_bin_failed_count * valid.float()
+        failure_sum = counts.sum(dim=1, keepdim=True)
+        adaptive_prob = uniform
+        if torch.any(failure_sum > 0.0):
+            kernel_size = max(1, int(getattr(motion, "adaptive_kernel_size", 3)))
+            adaptive_lambda = float(getattr(motion, "adaptive_lambda", 0.8))
+            if kernel_size > 1:
+                left = kernel_size // 2
+                right = kernel_size - 1 - left
+                offsets = torch.arange(kernel_size, dtype=torch.float32, device=self.device) - float(left)
+                kernel = torch.pow(torch.full_like(offsets, adaptive_lambda), torch.abs(offsets))
+                kernel = kernel / kernel.sum().clamp(min=1e-6)
+                padded = torch.nn.functional.pad(counts.unsqueeze(1), (left, right), mode="replicate")
+                smooth = torch.nn.functional.conv1d(padded, kernel.view(1, 1, -1)).squeeze(1)
+            else:
+                smooth = counts
+            smooth = smooth * valid.float()
+            smooth_sum = smooth.sum(dim=1, keepdim=True)
+            adaptive_prob = torch.where(smooth_sum > 0.0, smooth / smooth_sum.clamp(min=1e-6), uniform)
+        uniform_ratio = float(getattr(motion, "adaptive_uniform_ratio", 0.1))
+        prob = (1.0 - uniform_ratio) * adaptive_prob + uniform_ratio * uniform
+        prob = prob * valid.float()
+        prob = prob / prob.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        no_fail = failure_sum <= 0.0
+        prob = torch.where(no_fail, uniform, prob)
+        self.motion_sampling_prob[:] = prob
+        entropy = -(prob * (prob + 1e-12).log()).sum(dim=1) / torch.log(num_valid.clamp(min=2.0))
+        self.motion_sampling_entropy = entropy.mean()
+        pmax, imax = prob.max(dim=1)
+        top_motion = torch.argmax(pmax)
+        self.motion_sampling_top1_prob = pmax[top_motion]
+        self.motion_sampling_top1_bin = imax[top_motion].float()
+
+    def _update_adaptive_phase_failures(self, env_ids):
+        if not self._uses_trajectory_reference():
+            return
+        motion = self.mrobot_cfg.motion
+        if not bool(getattr(motion, "use_adaptive_phase_sampling", False)):
+            return
+        if env_ids is None or len(env_ids) == 0:
+            return
+        self._current_motion_bin_failed.zero_()
+        failure_mask = self.adaptive_phase_failure_buf[env_ids]
+        if not torch.any(failure_mask):
+            return
+        failed_envs = env_ids[failure_mask]
+        ref_ids = self.ref_idx[failed_envs].clamp(min=0, max=max(self.data_length - 1, 0))
+        phase_ids = self.phase_idx[failed_envs].clamp(min=0)
+        bin_ids = torch.div(phase_ids, self.motion_bin_size_frames, rounding_mode="floor")
+        bin_ids = torch.minimum(bin_ids, self.motion_num_bins[ref_ids] - 1).clamp(min=0)
+        flat_count = self.motion_bin_failed_count.view(-1)
+        flat_current = self._current_motion_bin_failed.view(-1)
+        flat_index = ref_ids * self.motion_bin_failed_count.shape[1] + bin_ids
+        ones = torch.ones_like(flat_index, dtype=torch.float32, device=self.device)
+        flat_count.scatter_add_(0, flat_index, ones)
+        flat_current.scatter_add_(0, flat_index, ones)
+        self._refresh_motion_sampling_prob()
+
+    def _sample_uniform_trajectory_phase_starts(self, ref_ids):
         demo_lengths = self.demo_lengths[ref_ids].clamp(min=1)
-        max_start = (demo_lengths - 900).clamp(min=1)
-        phase = torch.floor(torch.rand(len(ref_ids), device=self.device) * max_start.float()).long()
-        zero_init = torch.rand(len(ref_ids), device=self.device) > 0.5
-        phase[zero_init] = 0
+        sample_lengths = (demo_lengths - 1).clamp(min=1)
+        phase = torch.floor(torch.rand(len(ref_ids), device=self.device) * sample_lengths.float()).long()
+        return torch.minimum(phase, sample_lengths - 1)
+
+    def _sample_trajectory_phase_starts(self, ref_ids):
+        phase = self._sample_uniform_trajectory_phase_starts(ref_ids)
+        if len(ref_ids) == 0:
+            return phase
+        motion = self.mrobot_cfg.motion
+        zero_start_ratio = float(getattr(motion, "zero_start_ratio", 0.0))
+        zero_mask = torch.rand(len(ref_ids), device=self.device) < zero_start_ratio
+        sample_mask = ~zero_mask
+        if bool(getattr(motion, "use_adaptive_phase_sampling", False)) and torch.any(sample_mask):
+            sample_ref_ids = ref_ids[sample_mask]
+            probs = self.motion_sampling_prob[sample_ref_ids]
+            sampled_bins = torch.multinomial(probs, 1, replacement=True).squeeze(-1)
+            bin_start = sampled_bins * self.motion_bin_size_frames
+            demo_lengths = self.demo_lengths[sample_ref_ids].clamp(min=1)
+            max_start = (demo_lengths - 1).clamp(min=1)
+            bin_end = torch.minimum(bin_start + self.motion_bin_size_frames, max_start)
+            span = (bin_end - bin_start).clamp(min=1)
+            offsets = torch.floor(torch.rand(len(sample_ref_ids), device=self.device) * span.float()).long()
+            phase[sample_mask] = torch.minimum(bin_start + offsets, max_start - 1)
+        phase[zero_mask] = 0
         return phase
 
     def _pred_column(self, pred, name, default):
@@ -1920,6 +2100,41 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self._tracking_cache_valid = True
         return self._tracking_reward_cache
 
+    def debug_check_keypoint_alignment(self, env_ids=None):
+        """Print a one-shot keypoint alignment summary for manual debugging."""
+        if env_ids is None:
+            env_ids = torch.arange(min(self.num_envs, 4), device=self.device)
+        elif not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            cur_body_pos, target_pos, cur_body_quat, target_quat, cur_body_vel, target_vel, cur_body_ang_vel, target_ang_vel = (
+                self._get_tracking_reward_cache()
+            )
+            pos_err = torch.norm(cur_body_pos[env_ids] - target_pos[env_ids], dim=-1)
+            quat_err = _quat_error_mag_wxyz(
+                cur_body_quat[env_ids].reshape(-1, 4),
+                target_quat[env_ids].reshape(-1, 4),
+            ).reshape(len(env_ids), -1)
+            lin_vel_err = torch.norm(cur_body_vel[env_ids] - target_vel[env_ids], dim=-1)
+            ang_vel_err = torch.norm(cur_body_ang_vel[env_ids] - target_ang_vel[env_ids], dim=-1)
+            print(
+                "[MRobot keypoint debug] body_order="
+                + ", ".join(self._body_names_from_indices(self.all_tracking_indices)),
+                flush=True,
+            )
+            print(
+                "[MRobot keypoint debug] ref_order=pelvis, feet[2], knee[2], hip[2], pelvic_yaw[2], waist",
+                flush=True,
+            )
+            print(
+                "[MRobot keypoint debug] "
+                f"pos_err_mean={pos_err.mean().item():.6f}, pos_err_max={pos_err.max().item():.6f}, "
+                f"quat_err_mean={quat_err.mean().item():.6f}, quat_err_max={quat_err.max().item():.6f}, "
+                f"lin_vel_err_mean={lin_vel_err.mean().item():.6f}, "
+                f"ang_vel_err_mean={ang_vel_err.mean().item():.6f}",
+                flush=True,
+            )
+
     def _quat_err_6d(self, q_curr_flat, q_ref_flat, num_parts):
         q_c = q_curr_flat.reshape(-1, 4)
         q_r = q_ref_flat.reshape(-1, 4)
@@ -1931,6 +2146,7 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
     def _update_state_cache(self, force=False):
         if not force and self._state_cache_valid and self._state_cache_common_step == self.common_step_counter:
             return
+        total_profile_start = self._profile_section_start()
         profile_start = self._profile_section_start()
         self.root_states = self.robot.data.root_state_w
         self.dof_pos = self.robot.data.joint_pos[:, self.joint_sim_ids]
@@ -1948,6 +2164,7 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self._state_cache_common_step = self.common_step_counter
         self._state_cache_valid = True
         self._tracking_cache_valid = False
+        self._profile_section_end("state_cache", total_profile_start)
 
     def _pre_physics_step(self, actions):
         actions = torch.clip(actions, -self.mrobot_cfg.normalization.clip_actions, self.mrobot_cfg.normalization.clip_actions)
@@ -1959,7 +2176,9 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         # forwards without changing the target used by this action.
         self.full_actions.zero_()
         self.full_actions[:, self.num_control] = actions
+        profile_start = self._profile_section_start()
         self.full_actions[:, self.num_notcontrol] = self.ref_dof_pos[:, self.ref_num_notcontrol] / self.cfg.action_scale
+        self._profile_section_end("noncontrolled_ref_action", profile_start)
         self._apply_substep = 0
 
     def _apply_action(self):
@@ -1967,12 +2186,15 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.dof_vel = self.robot.data.joint_vel[:, self.joint_sim_ids]
         if self.obs_imu_delay_buffer is not None:
             self._record_sys_delay_state()
+        profile_start = self._profile_section_start()
         if self.mrobot_cfg.normalization.actions_filter:
             rate = float(self._apply_substep + 1) / float(max(self.cfg.decimation, 1))
             full_actions = (1.0 - rate) * self.last_full_actions + rate * self.full_actions
         else:
             full_actions = self.full_actions
         scaled = full_actions * self.cfg.action_scale
+        self._profile_section_end("action_filter", profile_start)
+        profile_start = self._profile_section_start()
         if self.action_delay_buffer is not None and getattr(self.mrobot_cfg.domain_rand, "action_delay", False):
             self.action_delay_buffer[:, :, self.action_delay_write_idx] = scaled
             read_idx = torch.remainder(
@@ -1981,6 +2203,7 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             )
             scaled = self.action_delay_buffer[self.env_ids_arange, :, read_idx]
             self.action_delay_write_idx = (self.action_delay_write_idx + 1) % self.action_delay_buffer_size
+        self._profile_section_end("action_delay", profile_start)
         self.delayed_full_actions_scaled[:] = scaled
         target = self.target_dof_pos
         target.copy_(self.ref_dof_pos)
@@ -2020,8 +2243,10 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             # phase is advanced for the next policy observation/action.  DirectRLEnv
             # calls _get_dones() before _get_rewards(), so the trajectory branch
             # advances here instead of in _get_dones().
+            profile_start = self._profile_section_start()
             self._advance_reference_phase()
             self.compute_ref_state()
+            self._profile_section_end("reference_update", profile_start)
         self._update_state_cache()
         anchor_pos_w, anchor_quat_w = self._get_current_anchor_pose()
         anchor_pos_local, _ = self._get_current_anchor_pose_local()
@@ -2216,13 +2441,29 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             zero = torch.zeros((), device=self.device)
             episode_info["mean_episode_length"] = zero
             episode_info["fall_ratio"] = zero
+            episode_info["fall_contact_ratio"] = zero
+            episode_info["base_too_low_ratio"] = zero
             episode_info["ref_end_ratio"] = zero
             episode_info["time_out_ratio"] = zero
+            episode_info["tracking_error_ratio"] = zero
+            episode_info["waist_z_bad_ratio"] = zero
+            episode_info["waist_ori_bad_ratio"] = zero
+            episode_info["foot_z_bad_ratio"] = zero
         else:
             episode_info["mean_episode_length"] = torch.mean(self.curriculum_episode_length_buf[env_ids].float())
             episode_info["fall_ratio"] = torch.mean(self.fall_reset_buf[env_ids].float())
+            episode_info["fall_contact_ratio"] = torch.mean(self.contact_reset_buf[env_ids].float())
+            episode_info["base_too_low_ratio"] = torch.mean(self.base_too_low_buf[env_ids].float())
             episode_info["ref_end_ratio"] = torch.mean(self.ref_end_reset_buf[env_ids].float())
             episode_info["time_out_ratio"] = torch.mean(self.time_out_buf[env_ids].float())
+            episode_info["tracking_error_ratio"] = torch.mean(self.tracking_error_reset_buf[env_ids].float())
+            episode_info["waist_z_bad_ratio"] = torch.mean(self.waist_z_bad_buf[env_ids].float())
+            episode_info["waist_ori_bad_ratio"] = torch.mean(self.waist_ori_bad_buf[env_ids].float())
+            episode_info["foot_z_bad_ratio"] = torch.mean(self.foot_z_bad_buf[env_ids].float())
+        if self._uses_trajectory_reference():
+            episode_info["sampling_entropy"] = self.motion_sampling_entropy
+            episode_info["sampling_top1_prob"] = self.motion_sampling_top1_prob
+            episode_info["sampling_top1_bin"] = self.motion_sampling_top1_bin
         episode_info["curriculum_stage"] = torch.tensor(float(max(self._domain_rand_curriculum_stage, 0)), device=self.device)
         episode_info["push_ratio"] = torch.tensor(float(self._current_push_ratio), device=self.device)
         episode_info["disturbance_ratio"] = torch.tensor(float(self._current_disturbance_ratio), device=self.device)
@@ -2332,17 +2573,61 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.contact_forces = self.backend.get_contact_forces()
         self._profile_section_end("dones_contact_read", profile_start)
         profile_start = self._profile_section_start()
-        self.time_out_buf = self.episode_length_buf > self.max_episode_length
+        self.time_out_buf = self.episode_length_buf >= self.max_episode_length
         contact_died = torch.zeros_like(self.time_out_buf)
         if len(self.termination_contact_indices) > 0:
             contact_died = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.0, dim=1)
-        low = self.root_states[:, 2] < 0.5
-        self.fall_reset_buf = (contact_died | low) & (self.episode_length_buf > 5)
+        grace_mask = self.episode_length_buf > 5
+        self.contact_reset_buf = contact_died & grace_mask
+        self.base_too_low_buf = (self.root_states[:, 2] < 0.5) & grace_mask
         if self._uses_trajectory_reference():
             max_phase = self.demo_lengths[self.ref_idx].clamp(min=1) - 1
             self.ref_end_reset_buf = self.phase_idx >= max_phase
+            term_cfg = getattr(self.mrobot_cfg, "termination", None)
+            if term_cfg is not None and bool(getattr(term_cfg, "use_tracking_error_termination", False)):
+                tracking_grace = self.episode_length_buf > int(getattr(term_cfg, "tracking_termination_grace_steps", 5))
+                ref_waist_z = self.ref_waist_pos[:, 0, 2]
+                cur_waist_z = self.rigid_state[:, self.waist_body_id, 2]
+                self.waist_z_bad_buf = (
+                    torch.abs(ref_waist_z - cur_waist_z) > float(getattr(term_cfg, "waist_z_threshold", 0.25))
+                ) & tracking_grace
+                ref_projected_gravity = _quat_rotate_inverse_wxyz(self.ref_waist_quat[:, 0, :], self.gravity_vec)
+                cur_projected_gravity = _quat_rotate_inverse_wxyz(
+                    self.rigid_state[:, self.waist_body_id, 3:7],
+                    self.gravity_vec,
+                )
+                self.waist_ori_bad_buf = (
+                    torch.abs(ref_projected_gravity[:, 2] - cur_projected_gravity[:, 2])
+                    > float(getattr(term_cfg, "waist_ori_threshold", 0.8))
+                ) & tracking_grace
+                if len(self.feet_indices) == 2:
+                    cur_feet_z = self.rigid_state[:, self.feet_indices, 2]
+                    ref_feet_z = self.ref_feet_pos[:, :, 2]
+                    self.foot_z_bad_buf = (
+                        torch.any(
+                            torch.abs(cur_feet_z - ref_feet_z) > float(getattr(term_cfg, "foot_z_threshold", 0.25)),
+                            dim=1,
+                        )
+                    ) & tracking_grace
+                else:
+                    self.foot_z_bad_buf[:] = False
+                self.tracking_error_reset_buf = self.waist_z_bad_buf | self.waist_ori_bad_buf | self.foot_z_bad_buf
+            else:
+                self.waist_z_bad_buf[:] = False
+                self.waist_ori_bad_buf[:] = False
+                self.foot_z_bad_buf[:] = False
+                self.tracking_error_reset_buf[:] = False
         else:
             self.ref_end_reset_buf[:] = False
+            self.waist_z_bad_buf[:] = False
+            self.waist_ori_bad_buf[:] = False
+            self.foot_z_bad_buf[:] = False
+            self.tracking_error_reset_buf[:] = False
+        self.fall_reset_buf = self.contact_reset_buf | self.base_too_low_buf | self.tracking_error_reset_buf
+        self.adaptive_phase_failure_buf = (
+            self.fall_reset_buf & (~self.time_out_buf) & (~self.ref_end_reset_buf)
+        )
+        # DirectRLEnv ORs reset_terminated with reset_time_outs after this return.
         self.reset_buf = self.fall_reset_buf | self.ref_end_reset_buf
         self._profile_section_end("dones_termination", profile_start)
         return self.reset_buf, self.time_out_buf
@@ -2372,6 +2657,10 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
                     self.tracking_score_sums[name][env_ids] = 0.0
             self._write_common_episode_infos(self.extras["episode"], env_ids)
         self._profile_section_end("reset_episode_logging", profile_start)
+        profile_start = self._profile_section_start()
+        if self._uses_trajectory_reference():
+            self._update_adaptive_phase_failures(env_ids)
+        self._profile_section_end("reset_adaptive_sampling", profile_start)
         profile_start = self._profile_section_start()
         self.robot.reset(env_ids)
         super()._reset_idx(env_ids)
@@ -2475,7 +2764,14 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.last_root_vel[env_ids] = 0.0
         self.last_torques[env_ids] = 0.0
         self.fall_reset_buf[env_ids] = False
+        self.contact_reset_buf[env_ids] = False
+        self.base_too_low_buf[env_ids] = False
         self.ref_end_reset_buf[env_ids] = False
+        self.tracking_error_reset_buf[env_ids] = False
+        self.waist_z_bad_buf[env_ids] = False
+        self.waist_ori_bad_buf[env_ids] = False
+        self.foot_z_bad_buf[env_ids] = False
+        self.adaptive_phase_failure_buf[env_ids] = False
         self.time_out_buf[env_ids] = False
         self.reset_buf[env_ids] = False
         self.curriculum_episode_length_buf[env_ids] = 0

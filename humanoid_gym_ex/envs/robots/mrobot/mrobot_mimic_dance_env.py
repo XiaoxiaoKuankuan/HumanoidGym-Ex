@@ -61,7 +61,6 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
         self.ankle_obs_pos_bias = torch.zeros(self.num_envs, n_ankle_obs, device=self.device, dtype=torch.float)
         self.ankle_obs_vel_bias = torch.zeros(self.num_envs, n_ankle_obs, device=self.device, dtype=torch.float)
         self._init_ankle_dq_randomization_buffers(n_ankle_obs)
-        self._build_hard_phase_windows()
 
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
         self.compute_observations()

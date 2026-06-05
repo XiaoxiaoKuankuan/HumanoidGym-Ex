@@ -12,8 +12,7 @@ from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
 
 
 DEFAULT_DANCE_MOTION_FILES = [
-    "/home/weil/hl_rl/hl_rl/humanoid/ref_pos/yellowdongtai_casbot02-guitar2_6R7R2R1R_hand01_whole_100hz_v1_keypoint.npz",
-    "/home/weil/hl_rl/hl_rl/humanoid/ref_pos/yellowdongtai_casbot02-bass1_6R7R2R1R_hand01_whole_100hz_v1_keypoint.npz",
+    "ref_pos/JT_GuangHuiSuiYue_DongTai_50HZ_keypoint.npz",
 ]
 
 REQUIRED_TRAJECTORY_FIELDS = (

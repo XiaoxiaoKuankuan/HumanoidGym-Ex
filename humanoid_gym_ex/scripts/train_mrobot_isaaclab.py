@@ -1,4 +1,4 @@
-"""Train MRobot BPM mimic in IsaacLab/IsaacSim with the local PPO runner."""
+"""Train MRobot mimic tasks in IsaacLab/IsaacSim with the local PPO runner."""
 
 import argparse
 import os
@@ -15,6 +15,11 @@ if str(_PROJECT_ROOT) not in sys.path:
 import numpy as np
 import torch
 from isaaclab.app import AppLauncher
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = False
 
 
 parser = argparse.ArgumentParser(description="Train MRobot mimic tasks in IsaacLab Direct workflow.")
@@ -124,10 +129,19 @@ def main():
         cfg_class = MrobotMimicBPMLabCfg
     if args_cli.seed is not None:
         train_cfg.seed = args_cli.seed
+    if args_cli.max_iterations is not None:
+        train_cfg.runner.max_iterations = args_cli.max_iterations
+    if args_cli.num_steps_per_env is not None:
+        train_cfg.runner.num_steps_per_env = args_cli.num_steps_per_env
+    if args_cli.run_name is not None:
+        train_cfg.runner.run_name = args_cli.run_name
+    if args_cli.experiment_name is not None:
+        train_cfg.runner.experiment_name = args_cli.experiment_name
     seed = set_seed(train_cfg.seed)
     env_cfg.seed = seed
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else cfg_class.env.num_envs
     env_cfg.sim.device = args_cli.device
+    env_cfg.num_steps_per_env = train_cfg.runner.num_steps_per_env
     env_cfg.disable_domain_randomization = args_cli.disable_domain_randomization
     env_cfg.deterministic_reset = args_cli.deterministic_reset
     env_cfg.profile_step_timings = args_cli.profile_step_timings
@@ -142,6 +156,7 @@ def main():
         f"task={args_cli.task}, num_envs={env_cfg.scene.num_envs}, "
         f"action_space={env_cfg.action_space}, observation_space={env_cfg.observation_space}, "
         f"state_space={env_cfg.state_space}, device={env_cfg.sim.device}, "
+        f"num_steps_per_env={train_cfg.runner.num_steps_per_env}, "
         f"profile_step_timings={env_cfg.profile_step_timings}",
         flush=True,
     )
@@ -155,15 +170,6 @@ def main():
     direct_env = env_class(env_cfg)
     vec_env = IsaacLabRslRlVecEnv(direct_env)
     vec_env.num_policy_actions = env_cfg.action_space
-
-    if args_cli.max_iterations is not None:
-        train_cfg.runner.max_iterations = args_cli.max_iterations
-    if args_cli.num_steps_per_env is not None:
-        train_cfg.runner.num_steps_per_env = args_cli.num_steps_per_env
-    if args_cli.run_name is not None:
-        train_cfg.runner.run_name = args_cli.run_name
-    if args_cli.experiment_name is not None:
-        train_cfg.runner.experiment_name = args_cli.experiment_name
     cfg_dict = class_to_dict(train_cfg)
 
     log_dir = None

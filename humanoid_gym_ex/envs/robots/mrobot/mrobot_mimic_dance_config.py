@@ -35,10 +35,13 @@ class MrobotMimicDanceCfg(MrobotMimicCommonCfg):
         reference_source = "trajectory"
         files = list(DEFAULT_DANCE_MOTION_FILES)
         allow_legacy_keypoint_fallback = False
-        use_hard_phase_sampling = False
-        hard_sampling_ratio = 0.3
-        hard_context_sec = 1.0
-        hard_phase_windows = {}
+        reference_fps = 50
+        zero_start_ratio = 0.1
+        use_adaptive_phase_sampling = True
+        adaptive_bin_size_sec = 1.0
+        adaptive_kernel_size = 3
+        adaptive_lambda = 0.8
+        adaptive_uniform_ratio = 0.1
         foot_contact_height_threshold = 0.08
 
     class asset(MrobotMimicCommonCfg.asset):
@@ -51,6 +54,14 @@ class MrobotMimicDanceCfg(MrobotMimicCommonCfg):
         action_scale = 0.25
         use_ref_residual_target = True
         decimation = 10
+        match_reference_fps = True
+
+    class termination:
+        use_tracking_error_termination = True
+        waist_z_threshold = 0.25
+        waist_ori_threshold = 0.8
+        foot_z_threshold = 0.25
+        tracking_termination_grace_steps = 5
 
     class rewards(MrobotMimicCommonCfg.rewards):
         dof_err_w = [
@@ -130,7 +141,9 @@ class MrobotMimicDanceCfgPPO(MrobotMimicCommonCfgPPO):
     class algorithm(MrobotMimicCommonCfgPPO.algorithm):
         normalizer_update_iterations = 2400
         entropy_coef = 0.005
-        learning_rate = 1e-4
+        learning_rate = 1e-3
+        schedule = "adaptive"
+        desired_kl = 0.01
         num_learning_epochs = 5
         gamma = 0.99
         lam = 0.95
@@ -141,7 +154,7 @@ class MrobotMimicDanceCfgPPO(MrobotMimicCommonCfgPPO):
         algorithm_class_name = "PPO"
         num_steps_per_env = 24
         max_iterations = 53000
-        save_interval = 500
+        save_interval = 1000
         experiment_name = "mrobot_dance"
         run_name = ""
         resume = False
