@@ -6,12 +6,15 @@ keypoint ``.npz`` trajectory files, not from the BPM reference network.
 
 import numpy as np
 
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config import MrobotMimicCfg, MrobotMimicCfgPPO
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_common_config import (
+    MrobotMimicCommonCfg,
+    MrobotMimicCommonCfgPPO,
+)
 from humanoid_gym_ex.utils.mrobot_trajectory_reference import DEFAULT_DANCE_MOTION_FILES
 
 
-class MrobotMimicDanceCfg(MrobotMimicCfg):
-    class env(MrobotMimicCfg.env):
+class MrobotMimicDanceCfg(MrobotMimicCommonCfg):
+    class env(MrobotMimicCommonCfg.env):
         frame_stack = 1
         c_frame_stack = 1
         # Dance policy proprio obs excludes waist and base linear velocity:
@@ -38,18 +41,18 @@ class MrobotMimicDanceCfg(MrobotMimicCfg):
         hard_phase_windows = {}
         foot_contact_height_threshold = 0.08
 
-    class asset(MrobotMimicCfg.asset):
+    class asset(MrobotMimicCommonCfg.asset):
         file = (
             "{LEGGED_GYM_ROOT_DIR}/resources/robots/CASBOT02_ENCOS_7dof_shell_20251015/"
             "Serial/urdf/CASBOT02_ENCOS_7dof_shell_20251015_guitar.urdf"
         )
 
-    class control(MrobotMimicCfg.control):
+    class control(MrobotMimicCommonCfg.control):
         action_scale = 0.25
         use_ref_residual_target = True
         decimation = 10
 
-    class rewards(MrobotMimicCfg.rewards):
+    class rewards(MrobotMimicCommonCfg.rewards):
         dof_err_w = [
             1.0,
             1.0,
@@ -65,7 +68,7 @@ class MrobotMimicDanceCfg(MrobotMimicCfg):
             1.0,
         ]
 
-        class sigma(MrobotMimicCfg.rewards.sigma):
+        class sigma(MrobotMimicCommonCfg.rewards.sigma):
             foot_height = 0.08
             whole_body_pos = 0.15
             whole_body_rot = 0.2
@@ -96,12 +99,12 @@ class MrobotMimicDanceCfg(MrobotMimicCfg):
             dof_pos_limits = -2.0
             torque_limits = -1.0
 
-    class noise(MrobotMimicCfg.noise):
+    class noise(MrobotMimicCommonCfg.noise):
         add_noise = True
         noise_level = 1.0
 
-    class normalization(MrobotMimicCfg.normalization):
-        class obs_scales(MrobotMimicCfg.normalization.obs_scales):
+    class normalization(MrobotMimicCommonCfg.normalization):
+        class obs_scales(MrobotMimicCommonCfg.normalization.obs_scales):
             lin_vel = 2.0
             ang_vel = 1.0
             dof_pos = 1.0
@@ -114,17 +117,17 @@ class MrobotMimicDanceCfg(MrobotMimicCfg):
         actions_filter = True
 
 
-class MrobotMimicDanceCfgPPO(MrobotMimicCfgPPO):
+class MrobotMimicDanceCfgPPO(MrobotMimicCommonCfgPPO):
     seed = 5
 
-    class policy(MrobotMimicCfgPPO.policy):
+    class policy(MrobotMimicCommonCfgPPO.policy):
         init_noise_std = np.array([0.8, 0.8, 0.8, 0.8, 1.2, 1.2, 0.8, 0.8, 0.8, 0.8, 1.2, 1.2])
         num_single_obs = 42
         num_goal_obs = 19
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
 
-    class algorithm(MrobotMimicCfgPPO.algorithm):
+    class algorithm(MrobotMimicCommonCfgPPO.algorithm):
         normalizer_update_iterations = 2400
         entropy_coef = 0.005
         learning_rate = 1e-4
@@ -133,7 +136,7 @@ class MrobotMimicDanceCfgPPO(MrobotMimicCfgPPO):
         lam = 0.95
         num_mini_batches = 4
 
-    class runner(MrobotMimicCfgPPO.runner):
+    class runner(MrobotMimicCommonCfgPPO.runner):
         policy_class_name = "ActorCritic"
         algorithm_class_name = "PPO"
         num_steps_per_env = 24

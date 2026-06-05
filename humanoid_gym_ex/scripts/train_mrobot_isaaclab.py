@@ -65,7 +65,10 @@ from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config_lab import (  
     MrobotMimicDanceLabCfg,
     MrobotMimicDanceLabCfgPPO,
 )
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config_lab import MrobotMimicLabCfg, MrobotMimicLabCfgPPO  # noqa: E402
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_bpm_config_lab import (  # noqa: E402
+    MrobotMimicBPMLabCfg,
+    MrobotMimicBPMLabCfgPPO,
+)
 from humanoid_gym_ex.envs.robots.xbot.isaaclab_vec_env import IsaacLabRslRlVecEnv  # noqa: E402
 
 
@@ -115,10 +118,10 @@ def main():
         env_class = MrobotMimicDanceIsaacLabEnv
         cfg_class = MrobotMimicDanceLabCfg
     else:
-        train_cfg = MrobotMimicLabCfgPPO()
+        train_cfg = MrobotMimicBPMLabCfgPPO()
         env_cfg = MrobotMimicIsaacLabEnvCfg()
         env_class = MrobotMimicIsaacLabEnv
-        cfg_class = MrobotMimicLabCfg
+        cfg_class = MrobotMimicBPMLabCfg
     if args_cli.seed is not None:
         train_cfg.seed = args_cli.seed
     seed = set_seed(train_cfg.seed)
@@ -134,6 +137,20 @@ def main():
         env_cfg.reference_model_path = args_cli.reference_model
     if args_cli.motion_files is not None:
         env_cfg.motion_files = [item.strip() for item in args_cli.motion_files.split(",") if item.strip()]
+    print(
+        "[train_mrobot_isaaclab] "
+        f"task={args_cli.task}, num_envs={env_cfg.scene.num_envs}, "
+        f"action_space={env_cfg.action_space}, observation_space={env_cfg.observation_space}, "
+        f"state_space={env_cfg.state_space}, device={env_cfg.sim.device}, "
+        f"profile_step_timings={env_cfg.profile_step_timings}",
+        flush=True,
+    )
+    if args_cli.task == "mrobot_dance":
+        print(
+            "[train_mrobot_isaaclab] motion_files="
+            + ", ".join(str(path) for path in (env_cfg.motion_files or cfg_class.motion.files)),
+            flush=True,
+        )
 
     direct_env = env_class(env_cfg)
     vec_env = IsaacLabRslRlVecEnv(direct_env)

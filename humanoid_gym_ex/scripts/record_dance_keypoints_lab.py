@@ -13,6 +13,8 @@ import argparse
 import csv
 import os
 import sys
+import threading
+import traceback
 from collections import OrderedDict
 from pathlib import Path
 
@@ -29,7 +31,11 @@ if str(_PROJECT_ROOT) not in sys.path:
 from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
 
 
-DATA_DT = 0.01
+PHYSICS_DT = 0.005
+CONTROL_DT = 0.02
+CONTROL_DECIMATION = 4
+DATA_DT = CONTROL_DT
+DATA_STRIDE = 2
 CLEAN_INITIAL_COPY_SOURCE_FRAME = 2
 DEFAULT_INPUT_DIR = "/home/weil/HumanoidGym-Ex/ref_pos"
 DEFAULT_OUTPUT_DIR = "/home/weil/HumanoidGym-Ex/ref_pos"
@@ -61,20 +67,83 @@ def _parse_args():
     parser.add_argument("--input_dir", default=DEFAULT_INPUT_DIR, help="Directory containing old .data dance files.")
     parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR, help="Directory for generated *_keypoint.npz/csv.")
     parser.add_argument("--file", type=str, default=None, help="Single .data file name or absolute path.")
-    parser.add_argument("--data_dt", type=float, default=DATA_DT)
+    parser.add_argument("--data_dt", type=float, default=DATA_DT, help="Output keypoint frame period. Default 0.02s = 50Hz.")
+    parser.add_argument(
+        "--data_stride",
+        type=int,
+        default=DATA_STRIDE,
+        help="Input .data frame stride. Default 2 converts old 100Hz .data to 50Hz keypoints.",
+    )
     parser.add_argument("--render", action="store_true", help="Open viewer while recording.")
     parser.add_argument("--no_save", action="store_true", help="Run conversion without writing output files.")
     parser.add_argument("--allow_missing", action="store_true", help="Skip missing default files.")
     parser.add_argument("--prepend_stand_s", type=float, default=0.0, help="Prepend still frames after recording.")
     parser.add_argument("--append_stand_s", type=float, default=0.0, help="Append still frames after recording.")
+    parser.add_argument(
+        "--show_cpu_governor_warning",
+        action="store_true",
+        help="Show IsaacSim's harmless missing cpufreq/scaling_governor startup warning.",
+    )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
     args.headless = not args.render
     args.input_dir = _resolve_path(args.input_dir)
     args.output_dir = _resolve_path(args.output_dir)
-    if args.file is not None and not os.path.isabs(args.file):
-        args.file = os.path.join(args.input_dir, args.file)
+    if args.file is not None:
+        file_arg = os.path.expanduser(args.file)
+        if os.path.isabs(file_arg):
+            args.file = file_arg
+        else:
+            candidates = [
+                os.path.join(LEGGED_GYM_ROOT_DIR, file_arg),
+                os.path.join(args.input_dir, file_arg),
+                os.path.join(args.input_dir, os.path.basename(file_arg)),
+            ]
+            args.file = next((path for path in candidates if os.path.isfile(path)), candidates[0])
     return args
+
+
+def _install_cpu_governor_stderr_filter(enabled=True):
+    """Hide one known harmless IsaacSim startup line on servers without cpufreq.
+
+    IsaacSim/Kit prints a raw shell ``cat`` error when Linux does not expose
+    ``/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor``.  That is common
+    on virtualized EPYC servers and does not affect simulation.  Filter only
+    that exact startup noise at the file-descriptor level so real stderr output
+    and tracebacks still pass through.
+    """
+    if not enabled or os.environ.get("HUMANOID_GYM_SHOW_CPU_GOVERNOR_WARNING") == "1":
+        return None
+
+    try:
+        original_stderr_fd = os.dup(2)
+        read_fd, write_fd = os.pipe()
+        os.dup2(write_fd, 2)
+        os.close(write_fd)
+    except OSError:
+        return None
+
+    needle = b"/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
+
+    def _forward_stderr():
+        pending = b""
+        with os.fdopen(read_fd, "rb", buffering=0) as source:
+            while True:
+                chunk = source.read(4096)
+                if not chunk:
+                    break
+                pending += chunk
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    if needle not in line:
+                        os.write(original_stderr_fd, line + b"\n")
+            if pending and needle not in pending:
+                os.write(original_stderr_fd, pending)
+        os.close(original_stderr_fd)
+
+    thread = threading.Thread(target=_forward_stderr, daemon=True)
+    thread.start()
+    return thread
 
 
 def _read_data(path):
@@ -184,6 +253,69 @@ def _quat_rotate_inverse_xyzw(q, v):
     return R.from_quat(q).inv().apply(v).astype(np.float32)
 
 
+def _recording_placeholder_motion_path():
+    """Create a tiny valid trajectory file so the recording env can boot.
+
+    The recorder only needs IsaacLab to instantiate the robot and report body
+    poses for externally written states.  It should not depend on the dance
+    keypoint file that it is about to generate, so we feed the trajectory env a
+    minimal inert reference during startup/reset.
+    """
+    path = os.path.join("/tmp", "mrobot_record_dance_placeholder_keypoint.npz")
+    if os.path.exists(path):
+        return path
+
+    frames = 8
+
+    def zeros(*shape):
+        return np.zeros((frames,) + shape, dtype=np.float32)
+
+    def identity_quat(parts):
+        quat = zeros(parts, 4)
+        quat[..., 3] = 1.0
+        return quat
+
+    root_states = zeros(13)
+    root_states[:, 2] = 0.9
+    root_states[:, 6] = 1.0
+    np.savez_compressed(
+        path,
+        dof_pos=zeros(29),
+        dof_vel=zeros(29),
+        root_states=root_states,
+        root_linvel=zeros(3),
+        root_angvel=zeros(3),
+        euler_xyz=zeros(3),
+        foot_height=zeros(2),
+        feet_contact=np.ones((frames, 2), dtype=np.float32),
+        pelvis_pos=zeros(1, 3),
+        pelvis_vel=zeros(1, 3),
+        pelvis_quat=identity_quat(1),
+        pelvis_ang_vel=zeros(1, 3),
+        feet_pos=zeros(2, 3),
+        feet_vel=zeros(2, 3),
+        feet_quat=identity_quat(2),
+        feet_ang_vel=zeros(2, 3),
+        knee_pos=zeros(2, 3),
+        knee_vel=zeros(2, 3),
+        knee_quat=identity_quat(2),
+        knee_ang_vel=zeros(2, 3),
+        hip_pos=zeros(2, 3),
+        hip_vel=zeros(2, 3),
+        hip_quat=identity_quat(2),
+        hip_ang_vel=zeros(2, 3),
+        pelvic_yaw_pos=zeros(2, 3),
+        pelvic_yaw_vel=zeros(2, 3),
+        pelvic_yaw_quat=identity_quat(2),
+        pelvic_yaw_ang_vel=zeros(2, 3),
+        waist_pos=zeros(1, 3),
+        waist_vel=zeros(1, 3),
+        waist_quat=identity_quat(1),
+        waist_ang_vel=zeros(1, 3),
+    )
+    return path
+
+
 def _configure_env(args):
     from humanoid_gym_ex.envs.robots.mrobot.isaaclab_env import MrobotMimicDanceIsaacLabEnv, MrobotMimicDanceIsaacLabEnvCfg
 
@@ -191,9 +323,15 @@ def _configure_env(args):
     env_cfg.seed = 123145
     env_cfg.scene.num_envs = 1
     env_cfg.sim.device = args.device
+    env_cfg.sim.dt = PHYSICS_DT
+    env_cfg.sim.render_interval = CONTROL_DECIMATION
+    env_cfg.decimation = CONTROL_DECIMATION
+    if hasattr(env_cfg, "contact_sensor"):
+        env_cfg.contact_sensor.update_period = CONTROL_DT
     env_cfg.disable_domain_randomization = True
     env_cfg.deterministic_reset = True
     env_cfg.profile_step_timings = False
+    env_cfg.motion_files = [_recording_placeholder_motion_path()]
     env = MrobotMimicDanceIsaacLabEnv(env_cfg)
     env.reset()
     return env
@@ -218,7 +356,7 @@ def _init_buffers():
     return buffers
 
 
-def _collect_for_file(env, data_pos, data_dt, render=False):
+def _collect_for_file(env, data_pos, data_dt, render=False, data_stride=1):
     env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
     default_joint_pos = env.robot.data.default_joint_pos[0:1].clone()
     default_joint_vel = env.robot.data.default_joint_vel[0:1].clone()
@@ -226,8 +364,10 @@ def _collect_for_file(env, data_pos, data_dt, render=False):
     last_dof_pos = None
     last_root = None
     last_rpy = None
+    data_stride = max(1, int(data_stride))
 
-    for src_idx in tqdm(range(data_pos.shape[0]), desc="frames", leave=False):
+    sample_indices = range(0, data_pos.shape[0], data_stride)
+    for sample_idx, src_idx in enumerate(tqdm(sample_indices, desc="frames", leave=False)):
         dof_pos_canon, root_xyzw, root_rpy = _data_row_to_canonical_state(data_pos[src_idx])
         if last_dof_pos is None:
             dof_vel_canon = np.zeros_like(dof_pos_canon)
@@ -258,7 +398,7 @@ def _collect_for_file(env, data_pos, data_dt, render=False):
         env.sim.forward()
         env.scene.update(dt=env.physics_dt)
 
-        if src_idx == 0:
+        if sample_idx == 0:
             continue
 
         buffers["dof_pos"].append(dof_pos_canon.copy())
@@ -388,11 +528,19 @@ def _write_csv(csv_path, ref_np):
 
 def _output_base_name(input_path):
     name = os.path.basename(input_path)
-    return name[:-5] if name.endswith(".data") else os.path.splitext(name)[0]
+    base = name[:-5] if name.endswith(".data") else os.path.splitext(name)[0]
+    base = base.replace("100HZ", "50HZ").replace("100hz", "50hz")
+    return base
 
 
 def record_dance_keypoints(args):
     input_paths = [args.file] if args.file else [os.path.join(args.input_dir, name) for name in DEFAULT_FILES]
+    print(
+        "[record_dance_keypoints_lab] start: "
+        f"input_paths={input_paths}, output_dir={args.output_dir}, "
+        f"data_dt={args.data_dt}, data_stride={args.data_stride}",
+        flush=True,
+    )
     missing = [path for path in input_paths if not os.path.isfile(path)]
     if missing and not args.allow_missing:
         raise FileNotFoundError(f"Missing input .data files: {missing[:3]}")
@@ -405,7 +553,7 @@ def record_dance_keypoints(args):
             if not os.path.isfile(input_path):
                 continue
             data = _read_data(input_path)
-            ref_np = _collect_for_file(env, data, args.data_dt, render=args.render)
+            ref_np = _collect_for_file(env, data, args.data_dt, render=args.render, data_stride=args.data_stride)
             prepend_frames = int(round(args.prepend_stand_s / args.data_dt))
             append_frames = int(round(args.append_stand_s / args.data_dt))
             ref_np = _apply_still_segments(ref_np, prepend_frames, append_frames)
@@ -430,11 +578,18 @@ def record_dance_keypoints(args):
 
 if __name__ == "__main__":
     args_cli = _parse_args()
+    _install_cpu_governor_stderr_filter(enabled=not args_cli.show_cpu_governor_warning)
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
+    print("[record_dance_keypoints_lab] IsaacSim app launched; building recording env...", flush=True)
     try:
         record_dance_keypoints(args_cli)
+    except BaseException:
+        print("[record_dance_keypoints_lab] ERROR before IsaacSim close:", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        raise
     finally:
+        print("[record_dance_keypoints_lab] closing IsaacSim app...", flush=True)
         simulation_app.close()
 
 

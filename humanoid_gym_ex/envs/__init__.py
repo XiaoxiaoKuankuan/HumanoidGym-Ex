@@ -43,10 +43,10 @@ def register_tasks():
     from .base.legged_robot import LeggedRobot
     from .robots.humanoid_config import XBotLCfg, XBotLCfgPPO
     from .robots.humanoid_env import XBotLFreeEnv
-    from .robots.mrobot.mrobot_mimic_config_gym import MrobotMimicGymCfg, MrobotMimicGymCfgPPO
+    from .robots.mrobot.mrobot_mimic_bpm_config_gym import MrobotMimicGymCfg, MrobotMimicGymCfgPPO
     MrobotMimicCfg = MrobotMimicGymCfg
     MrobotMimicCfgPPO = MrobotMimicGymCfgPPO
-    from .robots.mrobot.mrobot_mimic_env import MrobotMimicEnv
+    from .robots.mrobot.mrobot_mimic_bpm_env import MrobotMimicEnv
     from .robots.mrobot.mrobot_mimic_dance_config_gym import MrobotMimicDanceGymCfg, MrobotMimicDanceGymCfgPPO
     from .robots.mrobot.mrobot_mimic_dance_env import MrobotMimicDanceEnv
     from humanoid_gym_ex.utils.task_registry import task_registry as registry

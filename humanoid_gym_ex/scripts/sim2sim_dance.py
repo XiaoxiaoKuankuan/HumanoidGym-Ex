@@ -28,21 +28,19 @@ try:
     import mujoco
 except ImportError as exc:  # pragma: no cover - runtime dependency
     mujoco = None
+    mujoco_official_viewer = None
+    mujoco_viewer = None
     _MUJOCO_IMPORT_ERROR = exc
 else:
     _MUJOCO_IMPORT_ERROR = None
-
-try:
-    import mujoco.viewer as mujoco_passive_viewer
-except ImportError:  # pragma: no cover - optional viewer path
-    mujoco_passive_viewer = None
-
-try:
-    import mujoco_viewer
-except ImportError as exc:  # pragma: no cover - runtime dependency
-    mujoco_viewer = None
-    if _MUJOCO_IMPORT_ERROR is None:
-        _MUJOCO_IMPORT_ERROR = exc
+    try:
+        import mujoco.viewer as mujoco_official_viewer
+    except Exception:  # pragma: no cover - optional runtime dependency
+        mujoco_official_viewer = None
+    try:
+        import mujoco_viewer
+    except Exception:  # pragma: no cover - optional runtime dependency
+        mujoco_viewer = None
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
@@ -72,7 +70,7 @@ from humanoid_gym_ex.scripts.sim2sim_mimic import (
 from humanoid_gym_ex.utils.mrobot_trajectory_reference import DEFAULT_DANCE_MOTION_FILES, resolve_motion_file
 
 
-START_MOVING_STEP = 3000
+DEFAULT_START_MOVING_TIME = 3.0
 
 
 def _resolve_path(path):
@@ -243,79 +241,87 @@ def _read_terminal_key():
     return sys.stdin.read(1)
 
 
-def _create_mujoco_viewer(model, data, headless=False):
-    if headless:
-        return None, "headless"
-    if mujoco_passive_viewer is not None:
-        try:
-            viewer = mujoco_passive_viewer.launch_passive(model, data)
-            print("[sim2sim_dance] 使用官方 MuJoCo passive viewer，低频 sync 可加速可视化", flush=True)
-            return viewer, "passive"
-        except Exception as exc:
-            print(f"[sim2sim_dance] 官方 passive viewer 启动失败，回退 mujoco_viewer: {exc}", flush=True)
-    if mujoco_viewer is None:
-        raise ImportError("mujoco_viewer fallback is not installed and passive viewer failed")
-    viewer = mujoco_viewer.MujocoViewer(model, data)
-    print("[sim2sim_dance] 使用 mujoco_viewer 回退模式，仍按低频 render 刷新", flush=True)
-    return viewer, "mujoco_viewer"
+def _create_viewer(model, data, cfg):
+    backend = getattr(cfg.sim_config, "viewer", "mujoco_viewer")
+    if getattr(cfg.sim_config, "headless", False) or backend == "none":
+        return None, "none"
+
+    if backend in ("mujoco_viewer", "auto"):
+        if mujoco_viewer is not None:
+            return mujoco_viewer.MujocoViewer(model, data), "mujoco_viewer"
+        if backend == "mujoco_viewer":
+            raise ImportError("mujoco_viewer is not available; use --viewer passive or --headless")
+
+    if backend in ("passive", "auto"):
+        if mujoco_official_viewer is not None:
+            return mujoco_official_viewer.launch_passive(model, data), "passive"
+        if backend == "passive":
+            raise ImportError("mujoco.viewer is not available; use --viewer mujoco_viewer or --headless")
+
+    raise ValueError(f"Unsupported viewer backend: {backend}")
 
 
-def _sync_mujoco_viewer(viewer, viewer_type):
+def _viewer_running(viewer, backend):
     if viewer is None:
         return True
-    if viewer_type == "passive":
-        if not viewer.is_running():
-            return False
-        viewer.sync()
-        return True
-    viewer.render()
+    if backend == "passive":
+        return bool(viewer.is_running())
     return True
 
 
-def _close_mujoco_viewer(viewer):
-    if viewer is not None:
-        viewer.close()
+def _render_viewer(viewer, backend):
+    if viewer is None:
+        return
+    if backend == "passive":
+        viewer.sync()
+    else:
+        viewer.render()
 
 
 def run_mujoco(policy, cfg):
     if mujoco is None:
         raise ImportError("mujoco is required for sim2sim_dance") from _MUJOCO_IMPORT_ERROR
-    if (
-        not bool(getattr(cfg.sim_config, "headless", False))
-        and mujoco_passive_viewer is None
-        and mujoco_viewer is None
-    ):
-        raise ImportError("mujoco.viewer or mujoco_viewer is required for visual sim2sim_dance") from _MUJOCO_IMPORT_ERROR
 
     model = mujoco.MjModel.from_xml_path(cfg.sim_config.mujoco_model_path)
     model.opt.timestep = cfg.sim_config.dt
+    solver_iterations = getattr(cfg.sim_config, "solver_iterations", None)
+    if solver_iterations is not None:
+        model.opt.iterations = int(solver_iterations)
+    solver_ls_iterations = getattr(cfg.sim_config, "solver_ls_iterations", None)
+    if solver_ls_iterations is not None and hasattr(model.opt, "ls_iterations"):
+        model.opt.ls_iterations = int(solver_ls_iterations)
     data = mujoco.MjData(model)
-    viewer, viewer_type = _create_mujoco_viewer(
-        model,
-        data,
-        headless=bool(getattr(cfg.sim_config, "headless", False)),
-    )
+    viewer, viewer_backend = _create_viewer(model, data, cfg)
     mujoco.mj_forward(model, data)
-    decimation = int(cfg.sim_config.decimation)
-    viewer_render_interval = max(1, int(getattr(cfg.sim_config, "viewer_render_interval", 20)))
-    playback_speed = float(
-        getattr(
-            cfg.sim_config,
-            "playback_speed",
-            1.0 if bool(getattr(cfg.sim_config, "real_time", False)) else 0.0,
-        )
-    )
-    physics_hz = 1.0 / float(cfg.sim_config.dt)
-    control_hz = physics_hz / decimation
-    viewer_hz = physics_hz / viewer_render_interval
+    control_dt = cfg.sim_config.dt * cfg.sim_config.decimation
     print(
-        "[sim2sim_dance] 主循环配置: "
-        f"physics={physics_hz:.0f}Hz, policy/control={control_hz:.0f}Hz, "
-        f"viewer 每 {viewer_render_interval} 个底层 step 刷新一次(约 {viewer_hz:.0f}Hz), "
-        f"playback_speed={'不限速' if playback_speed <= 0 else playback_speed}",
+        "[sim2sim_dance] timing: "
+        f"sim_dt={cfg.sim_config.dt:.6f}s ({1.0 / cfg.sim_config.dt:.1f}Hz), "
+        f"control_dt={control_dt:.6f}s ({1.0 / control_dt:.1f}Hz), "
+        f"decimation={cfg.sim_config.decimation}",
         flush=True,
     )
-
+    render_interval = max(1, int(getattr(cfg.sim_config, "viewer_render_interval", 20)))
+    debug_record = bool(getattr(cfg.sim_config, "record_debug", False))
+    debug_record_interval = max(1, int(getattr(cfg.sim_config, "debug_record_interval", cfg.sim_config.decimation)))
+    profile_interval = int(getattr(cfg.sim_config, "profile_interval", 0))
+    profile = {
+        "count": 0,
+        "state": 0.0,
+        "policy": 0.0,
+        "control": 0.0,
+        "mj_step": 0.0,
+        "render": 0.0,
+        "total": 0.0,
+    }
+    if viewer is not None:
+        print(
+            f"[sim2sim_dance] viewer={viewer_backend}, render_interval={render_interval} low-level steps "
+            f"({render_interval * cfg.sim_config.dt:.3f}s)",
+            flush=True,
+        )
+    if not debug_record:
+        print("[sim2sim_dance] debug recording disabled; use --record_debug to save q/ref/action/force buffers.", flush=True)
     keyboard_fd = None
     keyboard_old_termios = None
     if sys.stdin.isatty():
@@ -368,24 +374,33 @@ def run_mujoco(policy, cfg):
     tau_buffer, q_buffer, dq_buffer, ref_buffer = [], [], [], []
     final_target_buffer, action_buffer, foot_force_buffer = [], [], []
 
-    for count_lowlevel in tqdm(range(int(cfg.sim_config.sim_duration / cfg.sim_config.dt)), desc="sim2sim_dance"):
-        step_start = time.time()
+    total_lowlevel_steps = int(cfg.sim_config.sim_duration / cfg.sim_config.dt)
+    start_moving_step = int(
+        round(float(getattr(cfg.sim_config, "start_moving_time", DEFAULT_START_MOVING_TIME)) / cfg.sim_config.dt)
+    )
+    control_cycle_start = None
+    control_cycle_index = 0
+    overrun_log_interval = max(1, int(getattr(cfg.sim_config, "overrun_log_interval", 1)))
+    iterator = tqdm(range(total_lowlevel_steps), desc="sim2sim_dance", mininterval=0.5, dynamic_ncols=True)
+    for count_lowlevel in iterator:
+        step_start = time.perf_counter()
+        if count_lowlevel % cfg.sim_config.decimation == 0:
+            control_cycle_start = step_start
+        if not _viewer_running(viewer, viewer_backend):
+            print("[sim2sim_dance] viewer closed, stopping simulation.", flush=True)
+            break
         if keyboard_fd is not None:
             key = _read_terminal_key()
             if key in ("s", "S"):
                 hold_first_frame = not hold_first_frame
                 print(f"[sim2sim_dance] hold_first_frame={hold_first_frame}", flush=True)
 
-        _, _, quat, _, omega, _ = get_obs(data)
+        t0 = time.perf_counter()
         q_parallel = parallel_xml_to_policy_pos_np(np.asarray(data.actuator_length, dtype=np.float64))
         dq_parallel = parallel_xml_to_policy_vel_np(np.asarray(data.actuator_velocity, dtype=np.float64))
         q = parallel_to_serial_pos_np(q_parallel, fourbar)
         dq = parallel_to_serial_vel_np(q, q_parallel, dq_parallel, fourbar)
-        obs_euler = R.from_quat(quat).as_euler("xyz")
-        if start_dance and initial_base_yaw is not None:
-            obs_euler[2] = wrap_to_pi_np(obs_euler[2] - initial_base_yaw)
-        else:
-            obs_euler[2] = 0.0
+        profile["state"] += time.perf_counter() - t0
 
         if (not start_dance) and cfg.sim_config.static_com_log_interval > 0:
             if count_lowlevel % cfg.sim_config.static_com_log_interval == 0:
@@ -399,7 +414,14 @@ def run_mujoco(policy, cfg):
                     msg += f" waist=({waist_world[0]:.4f},{waist_world[1]:.4f},{waist_world[2]:.4f})"
                 print(msg, flush=True)
 
-        if count_lowlevel % decimation == 0:
+        if count_lowlevel % cfg.sim_config.decimation == 0:
+            t_policy = time.perf_counter()
+            _, _, quat, _, omega, _ = get_obs(data)
+            obs_euler = R.from_quat(quat).as_euler("xyz")
+            if start_dance and initial_base_yaw is not None:
+                obs_euler[2] = wrap_to_pi_np(obs_euler[2] - initial_base_yaw)
+            else:
+                obs_euler[2] = 0.0
             last_action[:] = action
             if start_dance and not hold_first_frame:
                 ref_idx = min(ref_idx + 1, motion_length - 1)
@@ -441,9 +463,11 @@ def run_mujoco(policy, cfg):
                 ref_dof_val[np.asarray(cfg.env.ref_num_notcontrol, dtype=np.int64)] / cfg.control.action_scale
             )
             action[:] = np.clip(raw_action, -cfg.normalization.clip_actions, cfg.normalization.clip_actions)
+            profile["policy"] += time.perf_counter() - t_policy
 
+        t_control = time.perf_counter()
         if cfg.normalization.actions_filter:
-            rate = (count_lowlevel % decimation + 1.0) / decimation
+            rate = (count_lowlevel % cfg.sim_config.decimation + 1.0) / cfg.sim_config.decimation
             action_filter = (1.0 - rate) * last_action + rate * action
             target_q_filter[:] = action_filter * cfg.control.action_scale
         else:
@@ -468,41 +492,89 @@ def run_mujoco(policy, cfg):
         tau_parallel = serial_tau_to_parallel_policy_tau_np(tau_serial, q, q_parallel, fourbar)
         tau_xml = policy_parallel_to_xml_tau_np(tau_parallel)
         data.ctrl[:] = tau_xml
+        profile["control"] += time.perf_counter() - t_control
 
-        tau_buffer.append(tau_serial.copy())
-        q_buffer.append(q.copy())
-        dq_buffer.append(dq.copy())
-        ref_buffer.append(ref_dof_val.copy())
-        final_target_buffer.append(final_target.copy())
-        action_buffer.append(action.copy())
-        lf, rf, _ = get_foot_forces(model, data, left_foot_body_id, right_foot_body_id)
-        foot_force_buffer.append(np.concatenate((lf, rf)))
+        if debug_record and count_lowlevel % debug_record_interval == 0:
+            tau_buffer.append(tau_serial.copy())
+            q_buffer.append(q.copy())
+            dq_buffer.append(dq.copy())
+            ref_buffer.append(ref_dof_val.copy())
+            final_target_buffer.append(final_target.copy())
+            action_buffer.append(action.copy())
+            lf, rf, _ = get_foot_forces(model, data, left_foot_body_id, right_foot_body_id)
+            foot_force_buffer.append(np.concatenate((lf, rf)))
 
+        t_step = time.perf_counter()
         mujoco.mj_step(model, data)
-        if count_lowlevel % viewer_render_interval == 0:
-            if not _sync_mujoco_viewer(viewer, viewer_type):
-                print("[sim2sim_dance] viewer 已关闭，结束仿真", flush=True)
-                break
+        profile["mj_step"] += time.perf_counter() - t_step
+        if viewer is not None and count_lowlevel % render_interval == 0:
+            t_render = time.perf_counter()
+            _render_viewer(viewer, viewer_backend)
+            profile["render"] += time.perf_counter() - t_render
 
-        if (not start_dance) and count_lowlevel >= START_MOVING_STEP:
+        if (not start_dance) and count_lowlevel >= start_moving_step:
             start_dance = True
             ref_idx = 0
+            _, _, quat, _, _, _ = get_obs(data)
             initial_base_yaw = R.from_quat(quat).as_euler("xyz")[2]
-            print(f"--- Start Dance Reference at low-level step {START_MOVING_STEP} ---", flush=True)
+            print(
+                f"--- Start Dance Reference at low-level step {start_moving_step} "
+                f"({start_moving_step * cfg.sim_config.dt:.3f}s) ---",
+                flush=True,
+            )
 
-        if playback_speed > 0.0:
-            elapsed = time.time() - step_start
-            sleep_time = cfg.sim_config.dt / playback_speed - elapsed
+        if getattr(cfg.sim_config, "stop_on_fall", False):
+            if float(data.qpos[2]) < float(getattr(cfg.sim_config, "fall_height", 0.35)):
+                print(
+                    f"[sim2sim_dance] stop_on_fall: base height={float(data.qpos[2]):.3f} "
+                    f"at low-level step {count_lowlevel}",
+                    flush=True,
+                )
+                break
+
+        if cfg.sim_config.real_time and (count_lowlevel + 1) % cfg.sim_config.decimation == 0:
+            now = time.perf_counter()
+            cycle_elapsed = now - (control_cycle_start if control_cycle_start is not None else step_start)
+            sleep_time = control_dt - cycle_elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
+            elif control_cycle_index % overrun_log_interval == 0:
+                print(
+                    "[sim2sim_dance][overrun] "
+                    f"control_cycle={control_cycle_index}, elapsed={cycle_elapsed * 1000.0:.3f}ms "
+                    f"> target={control_dt * 1000.0:.3f}ms",
+                    flush=True,
+                )
+            control_cycle_index += 1
+        profile["total"] += time.perf_counter() - step_start
+        profile["count"] += 1
+        if profile_interval > 0 and profile["count"] >= profile_interval:
+            n = float(profile["count"])
+            print(
+                "[sim2sim_dance profile] avg per low-level step: "
+                f"state={profile['state'] / n * 1000:.3f}ms, "
+                f"policy={profile['policy'] / n * 1000:.3f}ms, "
+                f"control={profile['control'] / n * 1000:.3f}ms, "
+                f"mj_step={profile['mj_step'] / n * 1000:.3f}ms, "
+                f"render={profile['render'] / n * 1000:.3f}ms, "
+                f"total={profile['total'] / n * 1000:.3f}ms, "
+                f"speed={cfg.sim_config.dt / max(profile['total'] / n, 1e-9):.2f}x realtime",
+                flush=True,
+            )
+            for key in profile:
+                profile[key] = 0 if key == "count" else 0.0
 
-    _close_mujoco_viewer(viewer)
-    print(
-        "[sim2sim_dance] finished. "
-        f"q={np.asarray(q_buffer).shape}, ref={np.asarray(ref_buffer).shape}, "
-        f"action={np.asarray(action_buffer).shape}, foot_force={np.asarray(foot_force_buffer).shape}",
-        flush=True,
-    )
+    if viewer is not None:
+        viewer.close()
+    if debug_record:
+        print(
+            "[sim2sim_dance] finished. "
+            f"q={np.asarray(q_buffer).shape}, ref={np.asarray(ref_buffer).shape}, "
+            f"action={np.asarray(action_buffer).shape}, foot_force={np.asarray(foot_force_buffer).shape}",
+            flush=True,
+        )
+    else:
+        print("[sim2sim_dance] finished.", flush=True)
 
 
 def parse_args():
@@ -511,19 +583,49 @@ def parse_args():
     parser.add_argument("--motion_file", type=str, default=DEFAULT_DANCE_MOTION_FILES[1], help="Dance *_keypoint.npz or *_keypoint.csv path.")
     parser.add_argument("--terrain", action="store_true", help="Use terrain MuJoCo xml instead of plane.")
     parser.add_argument("--duration", type=float, default=195.0)
-    parser.add_argument("--real_time", action="store_true", help="Throttle MuJoCo loop to real time.")
-    parser.add_argument("--headless", action="store_true", help="Run MuJoCo without viewer.")
+    parser.add_argument("--sim_dt", type=float, default=0.002, help="Low-level MuJoCo timestep. Default 0.002s = 500Hz.")
+    parser.add_argument("--control_dt", type=float, default=0.02, help="Policy/control period. Default 0.02s = 50Hz.")
+    parser.set_defaults(real_time=True)
+    parser.add_argument("--real_time", dest="real_time", action="store_true", help="Throttle MuJoCo loop to real time. Enabled by default.")
+    parser.add_argument("--no_real_time", dest="real_time", action="store_false", help="Disable real-time pacing.")
+    parser.add_argument(
+        "--viewer",
+        type=str,
+        default="mujoco_viewer",
+        choices=["passive", "mujoco_viewer", "auto", "none"],
+        help="Viewer backend. mujoco_viewer keeps the old viewer UI; passive uses the official MuJoCo viewer.",
+    )
+    parser.add_argument("--headless", action="store_true", help="Disable viewer completely.")
     parser.add_argument(
         "--viewer_render_interval",
         type=int,
-        default=20,
-        help="Render/sync viewer every N low-level 1000Hz steps. 10=100Hz, 20=50Hz.",
+        default=10,
+        help="Render/sync viewer every N low-level steps. Default 10 gives 50Hz rendering at 500Hz physics.",
     )
+    parser.add_argument("--record_debug", action="store_true", help="Record q/ref/action/tau/foot-force debug buffers.")
     parser.add_argument(
-        "--playback_speed",
+        "--debug_record_interval",
+        type=int,
+        default=10,
+        help="Record debug buffers every N low-level steps when --record_debug is enabled.",
+    )
+    parser.add_argument("--static_com_log_interval", type=int, default=0, help="0 disables static COM logging.")
+    parser.add_argument("--solver_iterations", type=int, default=None, help="Optional MuJoCo solver iterations override.")
+    parser.add_argument("--solver_ls_iterations", type=int, default=None, help="Optional MuJoCo line-search iterations override.")
+    parser.add_argument("--profile_interval", type=int, default=0, help="Print timing every N low-level steps; 0 disables.")
+    parser.add_argument(
+        "--overrun_log_interval",
+        type=int,
+        default=1,
+        help="When real-time pacing is enabled, print every N control-cycle overruns. Default 1 prints every overrun.",
+    )
+    parser.add_argument("--stop_on_fall", action="store_true", help="Stop rollout once base height is below --fall_height.")
+    parser.add_argument("--fall_height", type=float, default=0.35, help="Base-height threshold used by --stop_on_fall.")
+    parser.add_argument(
+        "--start_moving_time",
         type=float,
-        default=None,
-        help="Wall-clock throttle speed. 0 means unlimited; 1 means real time; 2 means 2x real time.",
+        default=DEFAULT_START_MOVING_TIME,
+        help="Seconds to hold the first reference frame before advancing the dance trajectory.",
     )
     return parser.parse_args()
 
@@ -542,17 +644,26 @@ if __name__ == "__main__":
                 )
             motion_file = args.motion_file
             sim_duration = args.duration
-            dt = 0.001
-            decimation = 10
+            dt = args.sim_dt
+            control_dt = args.control_dt
+            decimation = int(round(control_dt / dt))
+            if decimation < 1 or abs(decimation * dt - control_dt) > 1e-9:
+                raise ValueError(f"control_dt ({control_dt}) must be an integer multiple of sim_dt ({dt}).")
             action_delay = 0
-            static_com_log_interval = 1000
+            static_com_log_interval = args.static_com_log_interval
             real_time = args.real_time
+            viewer = args.viewer
             headless = args.headless
-            viewer_render_interval = max(1, int(args.viewer_render_interval))
-            if args.playback_speed is None:
-                playback_speed = 1.0 if args.real_time else 0.0
-            else:
-                playback_speed = float(args.playback_speed)
+            viewer_render_interval = args.viewer_render_interval
+            record_debug = args.record_debug
+            debug_record_interval = args.debug_record_interval
+            solver_iterations = args.solver_iterations
+            solver_ls_iterations = args.solver_ls_iterations
+            profile_interval = args.profile_interval
+            overrun_log_interval = args.overrun_log_interval
+            stop_on_fall = args.stop_on_fall
+            fall_height = args.fall_height
+            start_moving_time = args.start_moving_time
 
         class robot_config:
             kps = np.array(

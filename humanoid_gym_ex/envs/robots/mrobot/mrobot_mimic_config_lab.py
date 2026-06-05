@@ -6,7 +6,7 @@ Disabled features and ankle domain-randomization flags are omitted on purpose.
 
 import numpy as np
 
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config import (
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_bpm_config import (
     ARMATURE_10020_12,
     ARMATURE_6408_25,
     ARMATURE_6416_25,
@@ -14,15 +14,19 @@ from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config import (
     DAMPING_10020_12,
     DAMPING_6408_25,
     DAMPING_6416_25,
-    MrobotMimicCfg,
-    MrobotMimicCfgPPO,
+    MrobotMimicBPMCfg,
+    MrobotMimicBPMCfgPPO,
     STIFFNESS_10020_12,
     STIFFNESS_6408_25,
     STIFFNESS_6416_25,
 )
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_common_config_lab import (
+    MrobotMimicCommonLabCfg,
+    MrobotMimicCommonLabCfgPPO,
+)
 
 
-class MrobotMimicLabCfg(MrobotMimicCfg):
+class MrobotMimicLabCfg(MrobotMimicCommonLabCfg):
     """Isaac Lab / Isaac Sim entry point (``isaaclab_env`` imports this as ``MrobotMimicCfg``)."""
 
     lab_joint_effort_limits = {
@@ -121,7 +125,7 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
         "vhead_2_joint": [-0.2618, 0.5236],
     }
 
-    class env(MrobotMimicCfg.env):
+    class env(MrobotMimicBPMCfg.env):
         num_single_obs = 45
         num_goal_obs = 19
         num_observations = num_single_obs + num_goal_obs
@@ -135,7 +139,7 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
         ref_num_notcontrol = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
         normalize_obs = True
 
-    class motion(MrobotMimicCfg.motion):
+    class motion(MrobotMimicBPMCfg.motion):
         reference_model_path = "BPM_dance/reference_state_keypoint_model.pt"
         bpm_range = [60.0, 170.0]
         include_zero_bpm = True
@@ -143,10 +147,10 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
         init_phase_range = [0.0, 2.0 * np.pi]
         foot_contact_height_threshold = 0.08
 
-    class safety(MrobotMimicCfg.safety):
+    class safety(MrobotMimicBPMCfg.safety):
         torque_limit = 1
 
-    class asset(MrobotMimicCfg.asset):
+    class asset(MrobotMimicBPMCfg.asset):
         file = (
             "{LEGGED_GYM_ROOT_DIR}/resources/robots/CASBOT02_ENCOS_7dof_shell_20251015/"
             "Serial/urdf/CASBOT02_ENCOS_7dof_shell_20251015_guitar.urdf"
@@ -155,22 +159,22 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
         fix_base_link = False
         self_collisions = 0
 
-    class terrain(MrobotMimicCfg.terrain):
+    class terrain(MrobotMimicBPMCfg.terrain):
         static_friction = 1.0
         dynamic_friction = 1.0
         restitution = 0.0
 
-    class noise(MrobotMimicCfg.noise):
+    class noise(MrobotMimicBPMCfg.noise):
         add_noise = True
         noise_level = 1.0
 
-        class noise_scales(MrobotMimicCfg.noise.noise_scales):
+        class noise_scales(MrobotMimicBPMCfg.noise.noise_scales):
             dof_pos = 0.01
             dof_vel = 0.5
             ang_vel = 0.3
             euler = 0.1
 
-    class init_state(MrobotMimicCfg.init_state):
+    class init_state(MrobotMimicBPMCfg.init_state):
         pos = [0.0, 0.0, 0.9]
         default_joint_angles = {
             "leg_l1_joint": -0.457,
@@ -204,7 +208,7 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
             "vhead_2_joint": 0.0,
         }
 
-    class control(MrobotMimicCfg.control):
+    class control(MrobotMimicBPMCfg.control):
         stiffness = {
             "leg_l1_joint": STIFFNESS_10020_12 / 2,
             "leg_l2_joint": STIFFNESS_10020_12 / 2,
@@ -271,10 +275,10 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
         use_ref_residual_target = False
         decimation = 10
 
-    class sim(MrobotMimicCfg.sim):
+    class sim(MrobotMimicBPMCfg.sim):
         dt = 0.001
 
-        class physx(MrobotMimicCfg.sim.physx):
+        class physx(MrobotMimicBPMCfg.sim.physx):
             solver_type = 1
             num_position_iterations = 4
             num_velocity_iterations = 0
@@ -282,7 +286,7 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
             max_depenetration_velocity = 1.0
             max_gpu_contact_pairs = 2**23
 
-    class domain_rand(MrobotMimicCfg.domain_rand):
+    class domain_rand(MrobotMimicBPMCfg.domain_rand):
         # Curriculum (Isaac Lab ``update_domain_rand_curriculum``)
         use_curriculum = True
         curriculum_mode = "adaptive"
@@ -391,8 +395,8 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
 
         resample_physx_randomization_on_small_reset = True
 
-    class rewards(MrobotMimicCfg.rewards):
-        class sigma(MrobotMimicCfg.rewards.sigma):
+    class rewards(MrobotMimicBPMCfg.rewards):
+        class sigma(MrobotMimicBPMCfg.rewards.sigma):
             whole_body_pos = 0.15
             whole_body_rot = 0.2
             whole_body_lin_vel = 1.0
@@ -400,7 +404,7 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
             root_pos = 0.3
             root_rot = 0.4
 
-        class scales(MrobotMimicCfg.rewards.scales):
+        class scales(MrobotMimicBPMCfg.rewards.scales):
             imition_joint_pos = 0.8
             imition_joint_vel = 0.2
             imitation_whole_body_ang_vel = 1.0
@@ -416,8 +420,8 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
             torque_limits = -2.0
             ankle_torque_limit = -3.0
 
-    class normalization(MrobotMimicCfg.normalization):
-        class obs_scales(MrobotMimicCfg.normalization.obs_scales):
+    class normalization(MrobotMimicBPMCfg.normalization):
+        class obs_scales(MrobotMimicBPMCfg.normalization.obs_scales):
             lin_vel = 2.0
             ang_vel = 1.0
             dof_pos = 1.0
@@ -429,10 +433,10 @@ class MrobotMimicLabCfg(MrobotMimicCfg):
         actions_filter = True
 
 
-class MrobotMimicLabCfgPPO(MrobotMimicCfgPPO):
+class MrobotMimicLabCfgPPO(MrobotMimicCommonLabCfgPPO):
     seed = 5
 
-    class policy(MrobotMimicCfgPPO.policy):
+    class policy(MrobotMimicBPMCfgPPO.policy):
         init_noise_std = np.array(
             [0.8, 0.8, 0.8, 0.8, 1.2, 1.2, 0.8, 0.8, 0.8, 0.8, 1.2, 1.2]
         )
@@ -441,7 +445,7 @@ class MrobotMimicLabCfgPPO(MrobotMimicCfgPPO):
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
 
-    class algorithm(MrobotMimicCfgPPO.algorithm):
+    class algorithm(MrobotMimicBPMCfgPPO.algorithm):
         normalizer_update_iterations = 2400
         entropy_coef = 0.005
         learning_rate = 1e-4
@@ -450,7 +454,7 @@ class MrobotMimicLabCfgPPO(MrobotMimicCfgPPO):
         lam = 0.95
         num_mini_batches = 4
 
-    class runner(MrobotMimicCfgPPO.runner):
+    class runner(MrobotMimicBPMCfgPPO.runner):
         policy_class_name = "ActorCritic"
         algorithm_class_name = "PPO"
         num_steps_per_env = 24

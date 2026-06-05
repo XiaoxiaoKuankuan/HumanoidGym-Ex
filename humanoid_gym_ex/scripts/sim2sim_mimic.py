@@ -22,7 +22,7 @@ from tqdm import tqdm
 from collections import deque
 from scipy.spatial.transform import Rotation as R
 from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config import MrobotMimicCfg
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_bpm_config import MrobotMimicCfg
 from humanoid_gym_ex.scripts.space4bar import Space4Bar
 from humanoid_gym_ex.utils.reference_state import ReferenceStateNet
 import torch

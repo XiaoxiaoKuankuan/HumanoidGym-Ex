@@ -2,15 +2,15 @@
 
 import numpy as np
 
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config_lab import (
-    MrobotMimicLabCfg,
-    MrobotMimicLabCfgPPO,
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_common_config_lab import (
+    MrobotMimicCommonLabCfg,
+    MrobotMimicCommonLabCfgPPO,
 )
 from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config import (
     MrobotMimicDanceCfg,
     MrobotMimicDanceCfgPPO,
 )
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config import (
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_common_config import (
     ARMATURE_10020_12,
     ARMATURE_6408_25,
     ARMATURE_6416_25,
@@ -24,10 +24,13 @@ from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config import (
 )
 
 
-class MrobotMimicDanceLabCfg(MrobotMimicLabCfg):
-    lab_joint_effort_limits = MrobotMimicLabCfg.lab_joint_effort_limits
-    lab_joint_velocity_limits = MrobotMimicLabCfg.lab_joint_velocity_limits
-    lab_joint_position_limits = MrobotMimicLabCfg.lab_joint_position_limits
+class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
+    lab_joint_effort_limits = MrobotMimicCommonLabCfg.lab_joint_effort_limits
+    lab_joint_velocity_limits = MrobotMimicCommonLabCfg.lab_joint_velocity_limits
+    lab_joint_position_limits = MrobotMimicCommonLabCfg.lab_joint_position_limits
+
+    class sim(MrobotMimicCommonLabCfg.sim):
+        dt = 0.005  # 200 Hz low-level physics
 
     class env(MrobotMimicDanceCfg.env):
         frame_stack = 1
@@ -49,7 +52,7 @@ class MrobotMimicDanceLabCfg(MrobotMimicLabCfg):
     class motion(MrobotMimicDanceCfg.motion):
         reference_source = "trajectory"
         files = [
-            "ref_pos/BS_GuangHuiSuiYue_DongTai_100HZ_keypoint.npz",
+            "ref_pos/BS_GuangHuiSuiYue_DongTai_50HZ_keypoint.npz",
             # "/home/weil/hl_rl/hl_rl/humanoid/ref_pos/yellowdongtai_casbot02-bass1_6R7R2R1R_hand01_whole_100hz_v1_keypoint.npz",
         ]
         allow_legacy_keypoint_fallback = False
@@ -66,16 +69,23 @@ class MrobotMimicDanceLabCfg(MrobotMimicLabCfg):
         )
         base_name = "base_link"
         waist_name = "waist_yaw_link"
-        foot_name = "leg_l6_link"
+        foot_name = MrobotMimicDanceCfg.asset.foot_name
+        ankle_name = MrobotMimicDanceCfg.asset.ankle_name
+        knee_name = MrobotMimicDanceCfg.asset.knee_name
+        hip_name = MrobotMimicDanceCfg.asset.hip_name
+        pelvic_yaw_name = MrobotMimicDanceCfg.asset.pelvic_yaw_name
+        head_name = MrobotMimicDanceCfg.asset.head_name
+        terminate_after_contacts_on = list(MrobotMimicDanceCfg.asset.terminate_after_contacts_on)
+        penalize_contacts_on = list(MrobotMimicDanceCfg.asset.penalize_contacts_on)
         fix_base_link = False
         self_collisions = 0
 
-    class terrain(MrobotMimicLabCfg.terrain):
+    class terrain(MrobotMimicCommonLabCfg.terrain):
         static_friction = 1.0
         dynamic_friction = 1.0
         restitution = 0.0
 
-    class init_state(MrobotMimicLabCfg.init_state):
+    class init_state(MrobotMimicCommonLabCfg.init_state):
         pos = [0.0, 0.0, 0.9]
         default_joint_angles = {
             "leg_l1_joint": -0.185,
@@ -109,7 +119,7 @@ class MrobotMimicDanceLabCfg(MrobotMimicLabCfg):
             "vhead_2_joint": 0.0,
         }
 
-    class control(MrobotMimicLabCfg.control):
+    class control(MrobotMimicCommonLabCfg.control):
         stiffness = {
             "leg_l1_joint": STIFFNESS_10020_12 / 2,
             "leg_l2_joint": STIFFNESS_10020_12 / 2,
@@ -174,9 +184,9 @@ class MrobotMimicDanceLabCfg(MrobotMimicLabCfg):
         }
         action_scale = 0.25
         use_ref_residual_target = True
-        decimation = 10
+        decimation = 4  # 50 Hz policy/control with sim.dt=0.005
 
-    class domain_rand(MrobotMimicLabCfg.domain_rand):
+    class domain_rand(MrobotMimicCommonLabCfg.domain_rand):
         use_curriculum = True
         curriculum_mode = "adaptive"
         curriculum_stage_iters = [0, 700, 1400, 2100]
@@ -217,9 +227,9 @@ class MrobotMimicDanceLabCfg(MrobotMimicLabCfg):
         dynamic_friction_range = [0.3, 1.2]
 
         randomize_restitution = True
-        restitution_range = [0.0, 0.2]
+        restitution_range = [0.0, 0.5]
 
-        randomize_motor_strength = True
+        randomize_motor_strength = False
         motor_strength_range = [0.9, 1.1]
 
         randomize_default_dof_pos_offset = True
@@ -266,15 +276,15 @@ class MrobotMimicDanceLabCfg(MrobotMimicLabCfg):
         max_push_vel_xy = 0.5
         max_push_ang_vel = 0.15
 
-        randomize_kp = True
+        randomize_kp = False
         kp_range = [0.9, 1.1]
-        randomize_kd = True
+        randomize_kd = False
         kd_range = [0.9, 1.1]
 
         action_delay = True
-        action_delay_range = [5, 20]
+        action_delay_range = [1, 4]  # 5-20 ms at 200 Hz physics
 
-        randomize_root_xy_reset = False
+        randomize_root_xy_reset = True
         root_xy_reset_range = [-0.05, 0.05]
         randomize_root_yaw_reset = True
         root_yaw_reset_range = [-0.17, 0.17]
@@ -282,7 +292,10 @@ class MrobotMimicDanceLabCfg(MrobotMimicLabCfg):
         randomize_init_dof_pos = True
         init_dof_pos_range = [-0.03, 0.03]
 
-        resample_physx_randomization_on_small_reset = True
+        # Lab-only speed knob: resetting PhysX materials/mass/COM/armature on
+        # every small reset is expensive.  Runtime buffers are still resampled
+        # every episode; PhysX properties are rewritten on full-env reset.
+        resample_physx_randomization_on_small_reset = False
 
     class rewards(MrobotMimicDanceCfg.rewards):
         dof_err_w = [
@@ -302,8 +315,8 @@ class MrobotMimicDanceLabCfg(MrobotMimicLabCfg):
 
         class sigma(MrobotMimicDanceCfg.rewards.sigma):
             foot_height = 0.08
-            whole_body_pos = 0.2
-            whole_body_rot = 0.3
+            whole_body_pos = 0.15
+            whole_body_rot = 0.4
             whole_body_lin_vel = 1.0
             whole_body_ang_vel = 3.14
             root_height = 0.3
@@ -315,24 +328,25 @@ class MrobotMimicDanceLabCfg(MrobotMimicLabCfg):
         class scales:
             # imition_joint_pos = 0.8
             # imition_joint_vel = 0.2
-            imition_foot_height = 1.0
-            imition_root_height = 0.3
-            imitation_whole_body_ang_vel = 0.4
-            imitation_whole_body_lin_vel = 0.5
+            # imition_foot_height = 0.7
+            # imition_root_height = 0.3
+            imitation_whole_body_ang_vel = 1.0
+            imitation_whole_body_lin_vel = 1.0
             imitation_whole_body_rot = 1.0
             imitation_whole_body_pos = 1.5
             imition_root_pos = 0.5
             imition_root_rot = 0.5
             # imitation_root_vel = 0.2
             # imition_base_ang_vel = 0.3
-            teleop_contact_mask = 1.0
-            foot_slip = -1
+            # teleop_contact_mask = 0.5
+            # foot_slip = -1
             # pre_landing_foot_z_vel = -0.08
-            feet_contact_forces = -0.02
-            dof_acc = -5e-6
-            action_rate = -0.01
-            dof_pos_limits = -2.0
-            torque_limits = -1.0
+            # feet_contact_forces = -0.02
+            # dof_acc = -5e-6
+            action_rate = -0.1
+            dof_pos_limits = -8.0
+            torque_limits = -2.0
+            termination = -100.0  
 
     class noise(MrobotMimicDanceCfg.noise):
         add_noise = True
@@ -368,7 +382,7 @@ class MrobotMimicDanceLabCfgPPO(MrobotMimicDanceCfgPPO):
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
 
-    class algorithm(MrobotMimicLabCfgPPO.algorithm):
+    class algorithm(MrobotMimicCommonLabCfgPPO.algorithm):
         normalizer_update_iterations = 2400
         entropy_coef = 0.005
         learning_rate = 1e-4

@@ -19,12 +19,12 @@ from isaaclab.utils import configclass
 
 from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
 from humanoid_gym_ex.envs.backends.isaaclab_backend import IsaacLabBackend
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config_lab import MrobotMimicLabCfg
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_bpm_config_lab import MrobotMimicBPMLabCfg
 from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config_lab import MrobotMimicDanceLabCfg
 from humanoid_gym_ex.utils.mrobot_trajectory_reference import get_motion_files_from_cfg, load_mrobot_trajectory_library
 from humanoid_gym_ex.utils.reference_state import JOINT_NAME_ALIASES, ReferenceStateNet
 
-MrobotMimicCfg = MrobotMimicLabCfg
+MrobotMimicCfg = MrobotMimicBPMLabCfg
 
 
 def _quat_wxyz_to_xyzw(quat):
@@ -133,7 +133,7 @@ def _resolve_reference_model_path(path):
     return path if os.path.isabs(path) else os.path.join(LEGGED_GYM_ROOT_DIR, path)
 
 
-def _isaaclab_default_joint_angles(mrobot_cfg_cls=MrobotMimicLabCfg):
+def _isaaclab_default_joint_angles(mrobot_cfg_cls=MrobotMimicBPMLabCfg):
     joint_angles = dict(mrobot_cfg_cls.init_state.default_joint_angles)
     # IsaacLab validates URDF limits during articulation initialization.  The
     # old IsaacGym default pose places these wrist roll joints just past the URDF
@@ -174,7 +174,7 @@ class MrobotMimicIsaacLabEnvCfg(DirectRLEnvCfg):
             gpu_max_rigid_contact_count=MrobotMimicCfg.sim.physx.max_gpu_contact_pairs,
         ),
     )
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=3.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=MrobotMimicCfg.env.num_envs, env_spacing=3.0, replicate_physics=True)
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
@@ -245,6 +245,20 @@ class MrobotMimicDanceIsaacLabEnvCfg(MrobotMimicIsaacLabEnvCfg):
     state_space = MrobotMimicDanceLabCfg.env.num_privileged_obs
     reference_model_path = ""
     motion_files = list(MrobotMimicDanceLabCfg.motion.files)
+    sim: SimulationCfg = SimulationCfg(
+        dt=MrobotMimicDanceLabCfg.sim.dt,
+        render_interval=decimation,
+        physx=PhysxCfg(
+            solver_type=MrobotMimicDanceLabCfg.sim.physx.solver_type,
+            min_position_iteration_count=MrobotMimicDanceLabCfg.sim.physx.num_position_iterations,
+            max_position_iteration_count=MrobotMimicDanceLabCfg.sim.physx.num_position_iterations,
+            min_velocity_iteration_count=MrobotMimicDanceLabCfg.sim.physx.num_velocity_iterations,
+            max_velocity_iteration_count=MrobotMimicDanceLabCfg.sim.physx.num_velocity_iterations,
+            bounce_threshold_velocity=MrobotMimicDanceLabCfg.sim.physx.bounce_threshold_velocity,
+            gpu_max_rigid_contact_count=MrobotMimicDanceLabCfg.sim.physx.max_gpu_contact_pairs,
+        ),
+    )
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=MrobotMimicDanceLabCfg.env.num_envs, env_spacing=3.0, replicate_physics=True)
 
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
@@ -282,11 +296,17 @@ class MrobotMimicDanceIsaacLabEnvCfg(MrobotMimicIsaacLabEnvCfg):
             )
         },
     )
+    contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/.*(base_link|waist_yaw_link|pelvic_yaw_link|knee_pitch_link|ankle_roll_link)",
+        history_length=1,
+        update_period=MrobotMimicDanceLabCfg.sim.dt * MrobotMimicDanceLabCfg.control.decimation,
+        track_air_time=False,
+    )
 
 
 class MrobotMimicIsaacLabEnv(DirectRLEnv):
     cfg: MrobotMimicIsaacLabEnvCfg
-    mrobot_cfg_cls = MrobotMimicLabCfg
+    mrobot_cfg_cls = MrobotMimicBPMLabCfg
 
     def __init__(self, cfg, render_mode=None, **kwargs):
         self.mrobot_cfg = self.mrobot_cfg_cls()
@@ -324,6 +344,7 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self._profile_step_count = 0
         self._profile_accum = {}
         self._active_profile_accum = None
+        self._print_startup_diagnostics()
 
     def _profile_sync(self):
         if "cuda" in str(self.device) and torch.cuda.is_available():
@@ -506,6 +527,63 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
     def _find_bodies(self, pattern):
         ids, _ = self.robot.find_bodies(pattern)
         return torch.as_tensor(ids, dtype=torch.long, device=self.device)
+
+    def _find_bodies_by_cfg_name(self, name):
+        return self._find_bodies(".*{}.*".format(name))
+
+    def _find_bodies_by_substrings(self, names):
+        body_names = list(getattr(self.robot, "body_names", []) or [])
+        ids = []
+        for name in names:
+            for body_id, body_name in enumerate(body_names):
+                if name in body_name and body_id not in ids:
+                    ids.append(body_id)
+        return torch.as_tensor(ids, dtype=torch.long, device=self.device)
+
+    def _body_names_from_indices(self, indices):
+        body_names = list(getattr(self.robot, "body_names", []) or [])
+        result = []
+        for idx in indices.detach().cpu().tolist():
+            idx = int(idx)
+            result.append(body_names[idx] if 0 <= idx < len(body_names) else f"<body:{idx}>")
+        return result
+
+    def _print_startup_diagnostics(self):
+        source = getattr(getattr(self.mrobot_cfg, "motion", None), "reference_source", "bpm")
+        print(
+            "[HumanoidGym-Ex] MRobot IsaacLab startup: "
+            f"task_reference={source}, num_envs={self.num_envs}, "
+            f"action_space={self.cfg.action_space}, observation_space={self.cfg.observation_space}, "
+            f"state_space={self.cfg.state_space}, device={self.device}",
+            flush=True,
+        )
+        if source == "trajectory":
+            print(
+                "[HumanoidGym-Ex] MRobot Dance motion files: "
+                + ", ".join([str(path) for path in getattr(self, "motion_files", [])]),
+                flush=True,
+            )
+        print(
+            "[HumanoidGym-Ex] MRobot body mapping: "
+            f"base={self._body_names_from_indices(self.base_indices)}, "
+            f"waist={self._body_names_from_indices(self.waist_indices)}, "
+            f"feet={self._body_names_from_indices(self.feet_indices)}, "
+            f"knee={self._body_names_from_indices(self.knee_indices)}, "
+            f"hip={self._body_names_from_indices(self.hip_indices)}, "
+            f"pelvic_yaw={self._body_names_from_indices(self.pelvic_yaw_indices)}",
+            flush=True,
+        )
+        sensor_body_names = list(getattr(self.contact_sensor, "body_names", []) or [])
+        print(
+            "[HumanoidGym-Ex] MRobot contact mapping: "
+            f"termination_robot={self._body_names_from_indices(self.termination_robot_indices)}, "
+            f"penalized_robot={self._body_names_from_indices(self.penalized_robot_indices)}, "
+            f"termination_sensor_indices={self.termination_contact_indices.detach().cpu().tolist()}, "
+            f"penalized_sensor_indices={self.penalised_contact_indices.detach().cpu().tolist()}, "
+            f"feet_sensor_indices={self.feet_contact_indices.detach().cpu().tolist()}, "
+            f"sensor_bodies={sensor_body_names}",
+            flush=True,
+        )
 
     def _body_index_from_name(self, name, default=0):
         ids, _ = self.robot.find_bodies(name)
@@ -831,31 +909,42 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.ref_root_linvel = torch.zeros(self.num_envs, 3, device=self.device)
         self.ref_root_angvel = torch.zeros(self.num_envs, 3, device=self.device)
         self.ref_euler_xyz = torch.zeros(self.num_envs, 3, device=self.device)
-        self.feet_indices = self._find_bodies(".*ankle_roll.*")
-        self.knee_indices = self._find_bodies(".*knee_pitch.*")
-        self.ankle_indices = self._find_bodies(".*ankle_pitch.*")
-        self.hip_indices = self._find_bodies(".*pelvic_roll.*")
-        self.pelvic_yaw_indices = self._find_bodies(".*pelvic_yaw.*")
-        self.base_indices = self._find_bodies("base_link")
-        self.waist_indices = self._find_bodies("waist_yaw_link")
+        # Match IsaacGym's body indexing semantics: resolve key bodies from
+        # cfg.asset substring names once at startup.  The contact sensor prim
+        # path remains a Lab-only performance filter, but all runtime body sets
+        # come from the same config names used by Gym.
+        self.feet_indices = self._find_bodies_by_cfg_name(cfg.asset.foot_name)
+        self.knee_indices = self._find_bodies_by_cfg_name(cfg.asset.knee_name)
+        self.ankle_indices = self._find_bodies_by_cfg_name(cfg.asset.ankle_name)
+        self.hip_indices = self._find_bodies_by_cfg_name(cfg.asset.hip_name)
+        self.pelvic_yaw_indices = self._find_bodies_by_cfg_name(getattr(cfg.asset, "pelvic_yaw_name", "pelvic_yaw_link"))
+        self.base_indices = self._find_bodies_by_cfg_name(cfg.asset.base_name)
+        self.waist_indices = self._find_bodies_by_cfg_name(cfg.asset.waist_name)
         self.base_body_id = int(self.base_indices[0].item()) if len(self.base_indices) else 0
         self.waist_body_id = int(self.waist_indices[0].item()) if len(self.waist_indices) else self.base_body_id
         self._validate_tracking_body_indices()
-        termination_robot_indices = torch.cat(
-            (self.base_indices, self.waist_indices, self.pelvic_yaw_indices, self.knee_indices), dim=0
-        ).long()
-        self.termination_contact_indices = self._contact_sensor_indices_for_robot_bodies(termination_robot_indices)
+        termination_robot_indices = self._find_bodies_by_substrings(getattr(cfg.asset, "terminate_after_contacts_on", []))
+        if len(termination_robot_indices) == 0:
+            termination_robot_indices = torch.cat(
+                (self.base_indices, self.waist_indices, self.pelvic_yaw_indices, self.knee_indices), dim=0
+            ).long()
+        self.termination_robot_indices = termination_robot_indices.long()
+        self.termination_contact_indices = self._contact_sensor_indices_for_robot_bodies(self.termination_robot_indices)
         self.feet_contact_indices = self._contact_sensor_indices_for_robot_bodies(self.feet_indices)
-        if len(self.termination_contact_indices) != len(termination_robot_indices):
+        if len(self.termination_contact_indices) != len(self.termination_robot_indices):
             sensor_names = ", ".join(getattr(self.contact_sensor, "body_names", []) or [])
             robot_names = ", ".join(getattr(self.robot, "body_names", []) or [])
             raise RuntimeError(
                 "MRobot IsaacLab termination contact mapping mismatch: "
                 f"sensor matched {len(self.termination_contact_indices)} bodies, "
-                f"expected {len(termination_robot_indices)}. "
+                f"expected {len(self.termination_robot_indices)}. "
                 f"contact_sensor.body_names=[{sensor_names}], robot.body_names=[{robot_names}]"
             )
-        self.penalised_contact_indices = self.termination_contact_indices
+        penalized_robot_indices = self._find_bodies_by_substrings(getattr(cfg.asset, "penalize_contacts_on", []))
+        if len(penalized_robot_indices) == 0:
+            penalized_robot_indices = self.termination_robot_indices
+        self.penalized_robot_indices = penalized_robot_indices.long()
+        self.penalised_contact_indices = self._contact_sensor_indices_for_robot_bodies(self.penalized_robot_indices)
         self.all_tracking_indices = torch.cat(
             (self.base_indices, self.feet_indices, self.knee_indices, self.hip_indices, self.pelvic_yaw_indices, self.waist_indices),
             dim=0,
@@ -918,9 +1007,20 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.action_delay_write_idx = 0
         self.action_delay_buffer_size = 0
         if getattr(cfg.domain_rand, "action_delay", False):
-            max_delay = max(1, int(getattr(cfg.domain_rand, "action_delay_range", [0, 1])[1]))
-            self.action_delay_buffer_size = max_delay
-            self.action_delay_buffer = torch.zeros(self.num_envs, cfg.env.num_actions, max_delay, device=self.device)
+            # Delay is counted in physics substeps because the buffer is
+            # advanced from _apply_action(), which IsaacLab calls once per
+            # sim step inside each policy/control step.  Delay seconds are
+            # therefore action_delay_timestep * cfg.sim.dt.
+            max_delay = max(0, int(getattr(cfg.domain_rand, "action_delay_range", [0, 1])[1]))
+            # Keep one extra slot so a delay equal to max_delay does not alias
+            # to zero delay in the circular buffer.
+            self.action_delay_buffer_size = max_delay + 1
+            self.action_delay_buffer = torch.zeros(
+                self.num_envs,
+                cfg.env.num_actions,
+                self.action_delay_buffer_size,
+                device=self.device,
+            )
         self._ankle_obs_joint_indices = torch.tensor(
             getattr(cfg.domain_rand, "ankle_obs_joint_indices", [4, 5, 10, 11]),
             dtype=torch.long,
@@ -1275,8 +1375,10 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             self.action_delay_buffer[env_ids] = 0.0
             if getattr(dr, "action_delay", False):
                 low, high = getattr(dr, "action_delay_range", [0, 1])
-                low_i = int(low)
-                high_i = max(low_i + 1, int(high))
+                low_i = max(0, int(low))
+                # torch.randint uses an exclusive high bound.  Config ranges
+                # are treated as inclusive physics-substep delays.
+                high_i = max(low_i, int(high)) + 1
                 self.action_delay_timestep[env_ids] = torch.randint(low_i, high_i, (n_envs,), device=self.device)
             else:
                 self.action_delay_timestep[env_ids] = 0
@@ -1659,6 +1761,7 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.tracking_ref_ang_vel_buf[:, 5:7] = self.ref_hip_ang_vel
         self.tracking_ref_ang_vel_buf[:, 7:9] = self.ref_pelvic_yaw_ang_vel
         self.tracking_ref_ang_vel_buf[:, 9:10] = self.ref_waist_ang_vel
+        self._tracking_cache_valid = False
 
     def _advance_reference_phase(self):
         if self._uses_trajectory_reference():
@@ -1911,6 +2014,14 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self._apply_substep += 1
 
     def _get_observations(self):
+        if self._uses_trajectory_reference():
+            # IsaacGym Dance uses LeggedRobot.post_physics_step: reward is
+            # computed against the current trajectory frame, then the reference
+            # phase is advanced for the next policy observation/action.  DirectRLEnv
+            # calls _get_dones() before _get_rewards(), so the trajectory branch
+            # advances here instead of in _get_dones().
+            self._advance_reference_phase()
+            self.compute_ref_state()
         self._update_state_cache()
         anchor_pos_w, anchor_quat_w = self._get_current_anchor_pose()
         anchor_pos_local, _ = self._get_current_anchor_pose_local()
@@ -2066,6 +2177,9 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
                 f"MRobot IsaacLab privileged obs dim mismatch: got {self.privileged_obs_buf.shape[1]}, "
                 f"cfg={self.mrobot_cfg.env.num_privileged_obs}"
             )
+        clip_obs = float(getattr(self.mrobot_cfg.normalization, "clip_observations", 50.0))
+        self.policy_obs_buf.clamp_(min=-clip_obs, max=clip_obs)
+        self.privileged_obs_buf.clamp_(min=-clip_obs, max=clip_obs)
         return {"policy": self.policy_obs_buf, "critic": self.privileged_obs_buf}
 
     def _prepare_reward_function(self):
@@ -2128,7 +2242,9 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             if name in self.tracking_score_sums:
                 self.tracking_score_sums[name] += raw_rew
         if "termination" in self.reward_scales:
-            rew = self.reset_buf.float() * self.reward_scales["termination"]
+            # Match Gym mimic: terminal reward only penalizes real falls, not
+            # normal timeouts or reference-trajectory end resets.
+            rew = self.fall_reset_buf.float() * self.reward_scales["termination"]
             rewards += rew
             self.episode_sums["termination"] += rew
         self.last_full_actions[:] = self.full_actions
@@ -2197,8 +2313,13 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
 
     def _get_dones(self):
         profile_start = self._profile_section_start()
-        self._advance_reference_phase()
-        self.compute_ref_state()
+        if self._uses_trajectory_reference():
+            # Keep Dance reward on the current phase_idx; _get_observations()
+            # advances to the next trajectory frame after reward/reset.
+            pass
+        else:
+            self._advance_reference_phase()
+            self.compute_ref_state()
         self._profile_section_end("dones_phase_ref", profile_start)
         profile_start = self._profile_section_start()
         self._update_state_cache()
@@ -2351,7 +2472,12 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.last_full_actions[env_ids] = 0.0
         self.delayed_full_actions_scaled[env_ids] = 0.0
         self.last_dof_vel[env_ids] = 0.0
+        self.last_root_vel[env_ids] = 0.0
         self.last_torques[env_ids] = 0.0
+        self.fall_reset_buf[env_ids] = False
+        self.ref_end_reset_buf[env_ids] = False
+        self.time_out_buf[env_ids] = False
+        self.reset_buf[env_ids] = False
         self.curriculum_episode_length_buf[env_ids] = 0
         self._clear_external_forces(env_ids)
         self._update_state_cache(force=True)

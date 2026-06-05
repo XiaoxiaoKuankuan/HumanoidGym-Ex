@@ -4,11 +4,11 @@ import torch
 
 from humanoid_gym_ex.envs.base.legged_robot_config import LeggedRobotCfg
 from humanoid_gym_ex.envs.robots.mrobot.mrobot_legged_robot import LeggedRobot, get_euler_xyz_tensor
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_env import MrobotMimicEnv
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_common_env import MrobotMimicCommonEnv
 from humanoid_gym_ex.utils.mrobot_trajectory_reference import get_motion_files_from_cfg, load_mrobot_trajectory_library
 
 
-class MrobotMimicDanceEnv(MrobotMimicEnv):
+class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
     """IsaacGym MRobot mimic task driven by specified trajectory ``.npz`` files."""
 
     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):

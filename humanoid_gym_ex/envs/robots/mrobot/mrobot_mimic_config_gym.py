@@ -1,7 +1,7 @@
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_config import MrobotMimicCfg, MrobotMimicCfgPPO
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_bpm_config import MrobotMimicBPMCfg, MrobotMimicBPMCfgPPO
 
 
-class MrobotMimicGymCfg(MrobotMimicCfg):
+class MrobotMimicGymCfg(MrobotMimicBPMCfg):
     """IsaacGym training config entry point.
 
     This class intentionally keeps the original migrated config unchanged.  It
@@ -11,6 +11,6 @@ class MrobotMimicGymCfg(MrobotMimicCfg):
     """
 
 
-class MrobotMimicGymCfgPPO(MrobotMimicCfgPPO):
-    class runner(MrobotMimicCfgPPO.runner):
+class MrobotMimicGymCfgPPO(MrobotMimicBPMCfgPPO):
+    class runner(MrobotMimicBPMCfgPPO.runner):
         save_config = "mrobot_mimic_config_gym.py"
