@@ -1,5 +1,6 @@
-from isaacgym.torch_utils import *
 from isaacgym import gymtorch
+from isaacgym.torch_utils import *
+import math
 import torch
 
 from humanoid_gym_ex.envs.base.legged_robot_config import LeggedRobotCfg
@@ -12,6 +13,7 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
     """IsaacGym MRobot mimic task driven by specified trajectory ``.npz`` files."""
 
     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
+        self._apply_reference_fps_decimation(cfg, sim_params)
         LeggedRobot.__init__(self, cfg, sim_params, physics_engine, sim_device, headless)
         self.last_feet_z = 0.05
         self.feet_height = torch.zeros((self.num_envs, 2), device=self.device)
@@ -51,6 +53,14 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
         self.phase_idx = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.last_root_offset = torch.zeros(self.num_envs, 7, device=self.device, dtype=torch.float)
         self.initial_base_yaw = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.waist_body_id = int(self.waist_indices[0].item()) if len(self.waist_indices) else int(self.base_indices[0].item())
+        self.contact_reset_buf = torch.zeros_like(self.fall_reset_buf)
+        self.base_too_low_buf = torch.zeros_like(self.fall_reset_buf)
+        self.tracking_error_reset_buf = torch.zeros_like(self.fall_reset_buf)
+        self.waist_z_bad_buf = torch.zeros_like(self.fall_reset_buf)
+        self.waist_ori_bad_buf = torch.zeros_like(self.fall_reset_buf)
+        self.foot_z_bad_buf = torch.zeros_like(self.fall_reset_buf)
+        self.adaptive_phase_failure_buf = torch.zeros_like(self.fall_reset_buf)
 
         self._ankle_obs_joint_indices = torch.tensor(
             getattr(self.cfg.domain_rand, "ankle_obs_joint_indices", [4, 5, 10, 11]),
@@ -61,9 +71,50 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
         self.ankle_obs_pos_bias = torch.zeros(self.num_envs, n_ankle_obs, device=self.device, dtype=torch.float)
         self.ankle_obs_vel_bias = torch.zeros(self.num_envs, n_ankle_obs, device=self.device, dtype=torch.float)
         self._init_ankle_dq_randomization_buffers(n_ankle_obs)
+        self._init_adaptive_phase_sampling()
+
+        reference_fps = float(getattr(self.cfg.motion, "reference_fps", 0.0))
+        expected_ref_dt = 1.0 / reference_fps if reference_fps > 0.0 else 0.0
+        print(
+            "[mrobot_dance][IsaacGym] timing: "
+            f"sim.dt={self.sim_params.dt:.6f}, control.decimation={self.cfg.control.decimation}, "
+            f"policy_dt={self.dt:.6f}, reference_fps={reference_fps:.3f}, "
+            f"expected_reference_dt={expected_ref_dt:.6f}, "
+            f"physics_substeps_per_rollout={self.cfg.env.num_steps_per_env * self.cfg.control.decimation if hasattr(self.cfg.env, 'num_steps_per_env') else 'n/a'}",
+            flush=True,
+        )
+        print(
+            "[mrobot_dance][IsaacGym] adaptive phase sampling: "
+            f"enabled={getattr(self.cfg.motion, 'use_adaptive_phase_sampling', False)}, "
+            f"zero_start_ratio={getattr(self.cfg.motion, 'zero_start_ratio', 0.0)}, "
+            f"bin_size_frames={self.motion_bin_size_frames}, "
+            f"num_bins={[int(x) for x in self.motion_num_bins.detach().cpu().tolist()]}",
+            flush=True,
+        )
 
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
         self.compute_observations()
+
+    @staticmethod
+    def _apply_reference_fps_decimation(cfg, sim_params):
+        if not bool(getattr(cfg.control, "match_reference_fps", False)):
+            cfg.control.decimation = max(1, int(getattr(cfg.control, "decimation", 1)))
+            return
+        reference_fps = float(getattr(cfg.motion, "reference_fps", 0.0))
+        sim_dt = float(getattr(sim_params, "dt", getattr(cfg.sim, "dt", 0.0)))
+        if reference_fps <= 0.0 or sim_dt <= 0.0:
+            cfg.control.decimation = max(1, int(getattr(cfg.control, "decimation", 1)))
+            return
+        raw_decimation = 1.0 / (reference_fps * sim_dt)
+        matched_decimation = max(1, int(round(raw_decimation)))
+        if not math.isclose(raw_decimation, float(matched_decimation), rel_tol=0.0, abs_tol=1e-6):
+            print(
+                "[mrobot_dance][IsaacGym][WARN] reference_fps does not divide sim.dt exactly: "
+                f"reference_fps={reference_fps}, sim_dt={sim_dt}, raw_decimation={raw_decimation:.6f}, "
+                f"using decimation={matched_decimation}",
+                flush=True,
+            )
+        cfg.control.decimation = matched_decimation
 
     def _load_trajectory_library(self):
         motion_cfg = getattr(self.cfg, "motion", None)
@@ -153,13 +204,168 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
         return torch.zeros_like(norm_phase)
 
     def _advance_reference_phase(self):
-        LeggedRobot._advance_reference_phase(self)
+        max_phase = self.demo_lengths[self.ref_idx].clamp(min=1) - 1
+        self.phase_idx[:] = torch.minimum(self.phase_idx + 1, max_phase)
+
+    def _init_adaptive_phase_sampling(self):
+        motion = self.cfg.motion
+        reference_fps = float(getattr(motion, "reference_fps", 1.0))
+        bin_size_sec = float(getattr(motion, "adaptive_bin_size_sec", 1.0))
+        self.motion_bin_size_frames = max(1, int(round(reference_fps * bin_size_sec)))
+        self.motion_num_bins = torch.ceil(self.demo_lengths.float() / float(self.motion_bin_size_frames)).long().clamp(min=1)
+        max_bins = int(torch.max(self.motion_num_bins).item())
+        bin_ids = torch.arange(max_bins, dtype=torch.long, device=self.device).unsqueeze(0)
+        self.motion_valid_bin_mask = bin_ids < self.motion_num_bins.unsqueeze(1)
+        self.motion_bin_failed_count = torch.zeros(self.data_length, max_bins, device=self.device)
+        self._current_motion_bin_failed = torch.zeros_like(self.motion_bin_failed_count)
+        self.motion_sampling_prob = torch.zeros_like(self.motion_bin_failed_count)
+        self.motion_sampling_entropy = torch.ones((), device=self.device)
+        self.motion_sampling_top1_prob = torch.zeros((), device=self.device)
+        self.motion_sampling_top1_bin = torch.zeros((), device=self.device)
+        self._refresh_motion_sampling_prob()
+
+    def _refresh_motion_sampling_prob(self):
+        motion = self.cfg.motion
+        valid = self.motion_valid_bin_mask
+        num_valid = self.motion_num_bins.float().clamp(min=1.0)
+        uniform = valid.float() / num_valid.unsqueeze(1)
+        counts = self.motion_bin_failed_count * valid.float()
+        failure_sum = counts.sum(dim=1, keepdim=True)
+        adaptive_prob = uniform
+        if torch.any(failure_sum > 0.0):
+            kernel_size = max(1, int(getattr(motion, "adaptive_kernel_size", 3)))
+            adaptive_lambda = float(getattr(motion, "adaptive_lambda", 0.8))
+            if kernel_size > 1:
+                left = kernel_size // 2
+                right = kernel_size - 1 - left
+                offsets = torch.arange(kernel_size, dtype=torch.float32, device=self.device) - float(left)
+                kernel = torch.pow(torch.full_like(offsets, adaptive_lambda), torch.abs(offsets))
+                kernel = kernel / kernel.sum().clamp(min=1e-6)
+                padded = torch.nn.functional.pad(counts.unsqueeze(1), (left, right), mode="replicate")
+                smooth = torch.nn.functional.conv1d(padded, kernel.view(1, 1, -1)).squeeze(1)
+            else:
+                smooth = counts
+            smooth = smooth * valid.float()
+            smooth_sum = smooth.sum(dim=1, keepdim=True)
+            adaptive_prob = torch.where(smooth_sum > 0.0, smooth / smooth_sum.clamp(min=1e-6), uniform)
+        uniform_ratio = float(getattr(motion, "adaptive_uniform_ratio", 0.1))
+        prob = (1.0 - uniform_ratio) * adaptive_prob + uniform_ratio * uniform
+        prob = prob * valid.float()
+        prob = prob / prob.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        no_fail = failure_sum <= 0.0
+        prob = torch.where(no_fail, uniform, prob)
+        self.motion_sampling_prob[:] = prob
+        entropy = -(prob * (prob + 1e-12).log()).sum(dim=1) / torch.log(num_valid.clamp(min=2.0))
+        self.motion_sampling_entropy = entropy.mean()
+        pmax, imax = prob.max(dim=1)
+        top_motion = torch.argmax(pmax)
+        self.motion_sampling_top1_prob = pmax[top_motion]
+        self.motion_sampling_top1_bin = imax[top_motion].float()
+
+    def _update_adaptive_phase_failures(self, env_ids):
+        motion = self.cfg.motion
+        if not bool(getattr(motion, "use_adaptive_phase_sampling", False)):
+            return
+        if len(env_ids) == 0:
+            return
+        self._current_motion_bin_failed.zero_()
+        failure_mask = self.adaptive_phase_failure_buf[env_ids]
+        if not torch.any(failure_mask):
+            return
+        failed_envs = env_ids[failure_mask]
+        ref_ids = self.ref_idx[failed_envs].clamp(min=0, max=max(self.data_length - 1, 0))
+        phase_ids = self.phase_idx[failed_envs].clamp(min=0)
+        bin_ids = torch.div(phase_ids, self.motion_bin_size_frames, rounding_mode="floor")
+        bin_ids = torch.minimum(bin_ids, self.motion_num_bins[ref_ids] - 1).clamp(min=0)
+        flat_count = self.motion_bin_failed_count.view(-1)
+        flat_current = self._current_motion_bin_failed.view(-1)
+        flat_index = ref_ids * self.motion_bin_failed_count.shape[1] + bin_ids
+        ones = torch.ones_like(flat_index, dtype=torch.float32, device=self.device)
+        flat_count.scatter_add_(0, flat_index, ones)
+        flat_current.scatter_add_(0, flat_index, ones)
+        self._refresh_motion_sampling_prob()
+
+    def _sample_uniform_trajectory_phase_starts(self, ref_ids):
+        demo_lengths = self.demo_lengths[ref_ids].clamp(min=1)
+        sample_lengths = (demo_lengths - 1).clamp(min=1)
+        phase = torch.floor(torch.rand(len(ref_ids), device=self.device) * sample_lengths.float()).long()
+        return torch.minimum(phase, sample_lengths - 1)
+
+    def _sample_mixed_phase_starts(self, ref_ids):
+        phase = self._sample_uniform_trajectory_phase_starts(ref_ids)
+        if len(ref_ids) == 0:
+            return phase
+        motion = self.cfg.motion
+        zero_start_ratio = float(getattr(motion, "zero_start_ratio", 0.0))
+        zero_mask = torch.rand(len(ref_ids), device=self.device) < zero_start_ratio
+        sample_mask = ~zero_mask
+        if bool(getattr(motion, "use_adaptive_phase_sampling", False)) and torch.any(sample_mask):
+            sample_ref_ids = ref_ids[sample_mask]
+            probs = self.motion_sampling_prob[sample_ref_ids]
+            sampled_bins = torch.multinomial(probs, 1, replacement=True).squeeze(-1)
+            bin_start = sampled_bins * self.motion_bin_size_frames
+            demo_lengths = self.demo_lengths[sample_ref_ids].clamp(min=1)
+            max_start = (demo_lengths - 1).clamp(min=1)
+            bin_end = torch.minimum(bin_start + self.motion_bin_size_frames, max_start)
+            span = (bin_end - bin_start).clamp(min=1)
+            offsets = torch.floor(torch.rand(len(sample_ref_ids), device=self.device) * span.float()).long()
+            phase[sample_mask] = torch.minimum(bin_start + offsets, max_start - 1)
+        phase[zero_mask] = 0
+        return phase
 
     def post_physics_step(self):
         LeggedRobot.post_physics_step(self)
 
     def check_termination(self):
-        LeggedRobot.check_termination(self)
+        termination_contact_buf = torch.any(
+            torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.0,
+            dim=1,
+        )
+        grace_mask = self.episode_length_buf > 5
+        self.contact_reset_buf = termination_contact_buf & grace_mask
+        self.time_out_buf = self.episode_length_buf >= self.max_episode_length
+        self.base_too_low_buf = (self.root_states[:, 2] < 0.5) & grace_mask
+        max_phase = self.demo_lengths[self.ref_idx].clamp(min=1) - 1
+        self.ref_end_reset_buf = self.phase_idx >= max_phase
+
+        term_cfg = getattr(self.cfg, "termination", None)
+        if term_cfg is not None and bool(getattr(term_cfg, "use_tracking_error_termination", False)):
+            tracking_grace = self.episode_length_buf > int(getattr(term_cfg, "tracking_termination_grace_steps", 5))
+            ref_waist_z = self.ref_waist_pos[:, 0, 2]
+            cur_waist_z = self.rigid_state[:, self.waist_body_id, 2]
+            self.waist_z_bad_buf = (
+                torch.abs(ref_waist_z - cur_waist_z) > float(getattr(term_cfg, "waist_z_threshold", 0.25))
+            ) & tracking_grace
+            ref_projected_gravity = quat_rotate_inverse(self.ref_waist_quat[:, 0, :], self.gravity_vec)
+            cur_projected_gravity = quat_rotate_inverse(
+                self.rigid_state[:, self.waist_body_id, 3:7],
+                self.gravity_vec,
+            )
+            self.waist_ori_bad_buf = (
+                torch.abs(ref_projected_gravity[:, 2] - cur_projected_gravity[:, 2])
+                > float(getattr(term_cfg, "waist_ori_threshold", 0.8))
+            ) & tracking_grace
+            if len(self.feet_indices) == 2:
+                cur_feet_z = self.rigid_state[:, self.feet_indices, 2]
+                ref_feet_z = self.ref_feet_pos[:, :, 2]
+                self.foot_z_bad_buf = (
+                    torch.any(
+                        torch.abs(cur_feet_z - ref_feet_z) > float(getattr(term_cfg, "foot_z_threshold", 0.25)),
+                        dim=1,
+                    )
+                ) & tracking_grace
+            else:
+                self.foot_z_bad_buf[:] = False
+            self.tracking_error_reset_buf = self.waist_z_bad_buf | self.waist_ori_bad_buf | self.foot_z_bad_buf
+        else:
+            self.waist_z_bad_buf[:] = False
+            self.waist_ori_bad_buf[:] = False
+            self.foot_z_bad_buf[:] = False
+            self.tracking_error_reset_buf[:] = False
+
+        self.fall_reset_buf = self.contact_reset_buf | self.base_too_low_buf | self.tracking_error_reset_buf
+        self.adaptive_phase_failure_buf = self.fall_reset_buf & (~self.time_out_buf) & (~self.ref_end_reset_buf)
+        self.reset_buf = self.fall_reset_buf | self.time_out_buf | self.ref_end_reset_buf
 
     def _reset_dofs(self, env_ids):
         LeggedRobot._reset_dofs(self, env_ids)
@@ -195,11 +401,29 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
         )
 
     def reset_idx(self, env_ids):
+        self._update_adaptive_phase_failures(env_ids)
         LeggedRobot.reset_idx(self, env_ids)
         if len(env_ids) == 0:
             return
+        episode_info = self.extras.get("episode", {})
+        episode_info["fall_contact_ratio"] = torch.mean(self.contact_reset_buf[env_ids].float())
+        episode_info["base_too_low_ratio"] = torch.mean(self.base_too_low_buf[env_ids].float())
+        episode_info["tracking_error_ratio"] = torch.mean(self.tracking_error_reset_buf[env_ids].float())
+        episode_info["waist_z_bad_ratio"] = torch.mean(self.waist_z_bad_buf[env_ids].float())
+        episode_info["waist_ori_bad_ratio"] = torch.mean(self.waist_ori_bad_buf[env_ids].float())
+        episode_info["foot_z_bad_ratio"] = torch.mean(self.foot_z_bad_buf[env_ids].float())
+        episode_info["sampling_entropy"] = self.motion_sampling_entropy
+        episode_info["sampling_top1_prob"] = self.motion_sampling_top1_prob
+        episode_info["sampling_top1_bin"] = self.motion_sampling_top1_bin
         self.phase_idx[env_ids] = self.episode_phase_buf[env_ids]
         self.compute_ref_state()
         self._resample_ankle_obs_bias(env_ids)
         self._resample_ankle_dq_randomization(env_ids)
         self.initial_base_yaw[env_ids] = get_euler_xyz_tensor(self.root_states[env_ids, 3:7])[:, 2]
+        self.contact_reset_buf[env_ids] = False
+        self.base_too_low_buf[env_ids] = False
+        self.tracking_error_reset_buf[env_ids] = False
+        self.waist_z_bad_buf[env_ids] = False
+        self.waist_ori_bad_buf[env_ids] = False
+        self.foot_z_bad_buf[env_ids] = False
+        self.adaptive_phase_failure_buf[env_ids] = False

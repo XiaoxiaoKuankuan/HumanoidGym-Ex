@@ -53,7 +53,9 @@ class MrobotMimicDanceCfg(MrobotMimicCommonCfg):
     class control(MrobotMimicCommonCfg.control):
         action_scale = 0.25
         use_ref_residual_target = True
-        decimation = 10
+        # 50Hz trajectory reference with sim.dt=0.005s -> 4 physics steps per policy step.
+        # The Gym/Lab envs still recompute this when match_reference_fps=True.
+        decimation = 4
         match_reference_fps = True
 
     class termination:

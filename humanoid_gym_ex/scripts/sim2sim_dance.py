@@ -580,7 +580,7 @@ def run_mujoco(policy, cfg):
 def parse_args():
     parser = argparse.ArgumentParser(description="MRobot dance sim2sim in MuJoCo.")
     parser.add_argument("--load_model", type=str, required=True, help="Path to .pt JIT or .onnx policy.")
-    parser.add_argument("--motion_file", type=str, default=DEFAULT_DANCE_MOTION_FILES[1], help="Dance *_keypoint.npz or *_keypoint.csv path.")
+    parser.add_argument("--motion_file", type=str, default=DEFAULT_DANCE_MOTION_FILES[0], help="Dance *_keypoint.npz or *_keypoint.csv path.")
     parser.add_argument("--terrain", action="store_true", help="Use terrain MuJoCo xml instead of plane.")
     parser.add_argument("--duration", type=float, default=195.0)
     parser.add_argument("--sim_dt", type=float, default=0.002, help="Low-level MuJoCo timestep. Default 0.002s = 500Hz.")
