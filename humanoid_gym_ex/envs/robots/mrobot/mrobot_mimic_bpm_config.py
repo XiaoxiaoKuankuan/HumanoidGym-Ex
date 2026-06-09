@@ -18,9 +18,10 @@ class MrobotMimicBPMCfg(MrobotMimicCommonCfg):
     """
 
     class env(MrobotMimicCommonCfg.env):
-        # q_err(12)+dq(12)+act(12)+angvel(3)+euler(3)+phase_sin/cos(2)+bpm(1)
+        # q(12)+dq(12)+act(12)+angvel(3)+euler(3)+phase_sin/cos(2)+bpm(1)
         num_single_obs = 45
-        num_goal_obs = 19
+        # ref_dof_pos(12)+ref_dof_vel(12)+waist_z(1)+waist_rp(2)+waist_vel(3)+waist_angvel_z(1)
+        num_goal_obs = 31
         num_observations = num_single_obs + num_goal_obs
         single_num_privileged_obs = 45
         num_privileged_obs = 45 + 146 + num_goal_obs
@@ -50,7 +51,7 @@ class MrobotMimicBPMCfg(MrobotMimicCommonCfg):
 class MrobotMimicBPMCfgPPO(MrobotMimicCommonCfgPPO):
     class policy(MrobotMimicCommonCfgPPO.policy):
         num_single_obs = 45
-        num_goal_obs = 19
+        num_goal_obs = 31
 
     class runner(MrobotMimicCommonCfgPPO.runner):
         experiment_name = "mrobot_mimic_May_music_BPM"

@@ -34,19 +34,26 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
         print("[mrobot_dance] 指定轨迹 reference 加载完成")
         print(f"[mrobot_dance] 轨迹数量: {self.data_length}")
         print(f"[mrobot_dance] 各轨迹真实长度: {[int(x) for x in self.demo_lengths.detach().cpu().tolist()]}")
+        print(
+            "[mrobot_dance] Observation layout changed: actor obs 61/73 -> 75, "
+            "critic obs 210/222 -> 197. "
+            "Old checkpoints and normalizer statistics are incompatible. "
+            "Train from scratch or reset normalizer.",
+            flush=True,
+        )
 
         self.last_root_quat = torch.zeros((self.num_envs, 4), device=self.device)
-        self.all_tracking_indices = torch.cat(
-            (
-                self.base_indices,
-                self.feet_indices,
-                self.knee_indices,
-                self.hip_indices,
-                self.pelvic_yaw_indices,
-                self.waist_indices,
-            ),
-            dim=0,
-        ).long()
+        self.all_tracking_indices = self._resolve_tracking_body_indices(
+            getattr(self.cfg.asset, "tracking_body_names", None)
+        )
+        self._init_tracking_reference_specs()
+        print(
+            "[mrobot_dance][IsaacGym] tracking bodies: "
+            f"count={len(self.all_tracking_indices)}, "
+            f"names={self._body_names_from_indices(self.all_tracking_indices)}, "
+            f"indices={self.all_tracking_indices.detach().cpu().tolist()}",
+            flush=True,
+        )
         self.is_static_stand = torch.zeros(self.num_envs, 1, device=self.device, dtype=torch.float)
         self.base_height_idx = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.ref_idx = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
@@ -123,11 +130,13 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
             motion_files,
             self.device,
             allow_legacy_keypoint_fallback=bool(getattr(motion_cfg, "allow_legacy_keypoint_fallback", False)),
+            foot_contact_height_threshold=float(getattr(motion_cfg, "foot_contact_height_threshold", 0.08)),
         )
         self.motion_files = library.files
         self.data_length = library.data_length
         self.demo_length = library.demo_length
         self.demo_lengths = library.demo_lengths
+        self.feet_contact_source = getattr(library, "feet_contact_source", "unknown")
         buffers = library.buffers
         self.dof_pos_buffer = buffers["dof_pos"]
         self.dof_vel_buffer = buffers["dof_vel"]
@@ -161,6 +170,7 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
         self.waist_vel_buffer = buffers["waist_vel"]
         self.waist_quat_buffer = buffers["waist_quat"]
         self.waist_ang_vel_buffer = buffers["waist_ang_vel"]
+        print(f"[mrobot_dance][IsaacGym] feet_contact_source={self.feet_contact_source}", flush=True)
 
     def compute_ref_state(self):
         max_phase = self.demo_lengths[self.ref_idx].clamp(min=1) - 1

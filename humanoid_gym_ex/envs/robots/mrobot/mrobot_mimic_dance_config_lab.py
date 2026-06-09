@@ -36,10 +36,10 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
         frame_stack = 1
         c_frame_stack = 1
         num_single_obs = 42
-        num_goal_obs = 19
+        num_goal_obs = 33
         num_observations = num_single_obs + num_goal_obs
         single_num_privileged_obs = 45
-        num_privileged_obs = 45 + 146 + num_goal_obs
+        num_privileged_obs = 45 + 119 + num_goal_obs
         num_actions = 29
         num_policy_actions = 12
         num_envs = 4096
@@ -75,6 +75,7 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
         hip_name = MrobotMimicDanceCfg.asset.hip_name
         pelvic_yaw_name = MrobotMimicDanceCfg.asset.pelvic_yaw_name
         head_name = MrobotMimicDanceCfg.asset.head_name
+        tracking_body_names = list(MrobotMimicDanceCfg.asset.tracking_body_names)
         terminate_after_contacts_on = list(MrobotMimicDanceCfg.asset.terminate_after_contacts_on)
         penalize_contacts_on = list(MrobotMimicDanceCfg.asset.penalize_contacts_on)
         fix_base_link = False
@@ -289,8 +290,8 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
         randomize_kd = False
         kd_range = [0.9, 1.1]
 
-        action_delay = True
-        action_delay_range = [1, 4]  # 5-20 ms at 200 Hz physics
+        action_delay = False
+        action_delay_range = [0, 0]
 
         randomize_root_xy_reset = True
         root_xy_reset_range = [-0.05, 0.05]
@@ -335,8 +336,8 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
 
         class scales:
             # imition_joint_pos = 0.8
-            # imition_joint_vel = 0.2
-            # imition_foot_height = 0.7
+            imition_joint_vel = 0.2
+            imition_foot_height = 0.7
             # imition_root_height = 0.3
             imitation_whole_body_ang_vel = 1.0
             imitation_whole_body_lin_vel = 1.0
@@ -353,7 +354,7 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
             # dof_acc = -5e-6
             action_rate = -0.1
             dof_pos_limits = -8.0
-            torque_limits = -2.0
+            torque_limits = -1.0
             termination = -100.0  
 
     class noise(MrobotMimicDanceCfg.noise):
@@ -377,7 +378,7 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
 
         clip_observations = 50
         clip_actions = 50
-        actions_filter = True
+        actions_filter = False
 
 
 class MrobotMimicDanceLabCfgPPO(MrobotMimicDanceCfgPPO):
@@ -386,7 +387,7 @@ class MrobotMimicDanceLabCfgPPO(MrobotMimicDanceCfgPPO):
     class policy(MrobotMimicDanceCfgPPO.policy):
         init_noise_std = np.array([0.8, 0.8, 0.8, 0.8, 1.2, 1.2, 0.8, 0.8, 0.8, 0.8, 1.2, 1.2])
         num_single_obs = 42
-        num_goal_obs = 19
+        num_goal_obs = 33
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
 
@@ -405,7 +406,7 @@ class MrobotMimicDanceLabCfgPPO(MrobotMimicDanceCfgPPO):
         policy_class_name = "ActorCritic"
         algorithm_class_name = "PPO"
         num_steps_per_env = 24
-        max_iterations = 53000
+        max_iterations = 153000
         save_interval = 1000
         experiment_name = "mrobot_dance_isaaclab"
         run_name = ""

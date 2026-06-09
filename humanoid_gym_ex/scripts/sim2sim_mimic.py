@@ -177,7 +177,15 @@ class ReferenceMotionGenerator:
 
         if controlled_indices is None:
             controlled_indices = list(range(12))
-        ref_dof_pos_curr = ref_dof[np.asarray(controlled_indices, dtype=np.int64)].astype(np.float32)
+        controlled_indices_np = np.asarray(controlled_indices, dtype=np.int64)
+        ref_dof_pos_curr = ref_dof[controlled_indices_np].astype(np.float32)
+        ref_dof_vel = np.zeros_like(ref_dof, dtype=np.float64)
+        for idx, pos_column in enumerate(REFERENCE_DOF_POS_COLUMNS):
+            if idx >= len(ref_dof_vel):
+                break
+            vel_column = pos_column[:-4] + "_vel" if pos_column.endswith("_pos") else pos_column + "_vel"
+            ref_dof_vel[idx] = self.get(pred, vel_column, 0.0)
+        ref_dof_vel_curr = (ref_dof_vel[controlled_indices_np] * 0.05).astype(np.float32)
         ref_waist_quat_xyzw = standardize_quat(
             np.array(
                 [
@@ -201,12 +209,14 @@ class ReferenceMotionGenerator:
         )
         ref_waist_angvel_z = np.array([self.get(pred, "waist_ang_vel_0_z", 0.0)], dtype=np.float32)
         if zero_ref_motion:
+            ref_dof_vel_curr[:] = 0.0
             ref_waist_linvel[:] = 0.0
             ref_waist_angvel_z[:] = 0.0
 
         goal_buf = np.concatenate(
             [
                 ref_dof_pos_curr,
+                ref_dof_vel_curr,
                 ref_waist_pos_z,
                 ref_waist_rp,
                 ref_waist_linvel,
@@ -855,11 +865,11 @@ def run_mujoco(policy, cfg):
                 goal_buf = hold_goal_buf.copy()
                 ref_dof_val = hold_ref_dof_val.copy()
 
-            # --- 构建 Proprioception：关节位置观测使用 q - 当前参考关节角 ---
+            # --- 构建 Proprioception：关节位置观测使用当前关节角 q ---
             control_idx = np.asarray(cfg.env.num_control, dtype=np.int64)
             n_ctrl = len(control_idx)
             obs = np.zeros([1, cfg.env.num_single_obs], dtype=np.float32)
-            obs[0, 0:n_ctrl] = (q[control_idx] - ref_dof_val[control_idx]) * 1.0
+            obs[0, 0:n_ctrl] = q[control_idx] * 1.0
             obs[0, n_ctrl:2 * n_ctrl] = dq[control_idx] * 0.05
             obs[0, 2 * n_ctrl:3 * n_ctrl] = action[control_idx]
             offset = 3 * n_ctrl
@@ -869,8 +879,22 @@ def run_mujoco(policy, cfg):
             obs[0, offset + 7:offset + 8] = math.cos(phase_rad)
             obs[0, offset + 8:offset + 9] = reference_generator.normalized_bpm(bpm_cmd)
 
-            # --- 拼接 Policy Input: 当前 obs(45) + 当前 goal(19) = 64 ---
+            # --- 拼接 Policy Input: 当前 obs(45) + 当前 goal(31) = 76 ---
             policy_input = np.concatenate([obs.reshape(-1), goal_buf]).reshape(1, -1).astype(np.float32)
+            if not getattr(cfg.sim_config, "_printed_obs_layout_warning", False):
+                print(
+                    "[sim2sim_mimic] Observation layout changed: actor obs 64 -> 76. "
+                    "Old checkpoints and normalizer statistics are incompatible. "
+                    "Train from scratch or reset normalizer.",
+                    flush=True,
+                )
+                print(
+                    "[sim2sim_mimic] observation shapes: "
+                    f"obs_now.shape={obs.shape}, goal_buf.shape={goal_buf.shape}, "
+                    f"actor obs.shape={policy_input.shape}",
+                    flush=True,
+                )
+                cfg.sim_config._printed_obs_layout_warning = True
             if goal_buf.shape[0] != cfg.env.num_goal_obs:
                 raise RuntimeError(f"goal 维度错误: got {goal_buf.shape[0]}, expected {cfg.env.num_goal_obs}")
             if policy_input.shape[1] != cfg.env.num_observations:

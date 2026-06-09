@@ -1,8 +1,8 @@
 """MuJoCo sim2sim for the MRobot specified-trajectory dance task.
 
 This is the trajectory-reference counterpart of ``sim2sim_mimic.py``.  It
-loads a dance ``*_keypoint.npz`` or ``*_keypoint.csv`` file, builds the new 61-dim policy input
-(``42`` proprio + ``19`` current goal), and drives the 29-DOF MuJoCo model with
+loads a dance ``*_keypoint.npz`` or ``*_keypoint.csv`` file, builds the new 75-dim policy input
+(``42`` proprio + ``33`` current goal), and drives the 29-DOF MuJoCo model with
 12 policy-controlled leg joints while the remaining joints follow reference.
 """
 
@@ -48,6 +48,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
 from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config import MrobotMimicDanceCfg
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config_lab import MrobotMimicDanceLabCfg
 from humanoid_gym_ex.scripts.sim2sim_mimic import (
     compute_body_midpoint,
     compute_world_com,
@@ -62,6 +63,7 @@ from humanoid_gym_ex.scripts.sim2sim_mimic import (
     parallel_xml_to_policy_vel_np,
     pd_control,
     policy_parallel_to_xml_tau_np,
+    SERIAL_DOF_JOINT_NAMES,
     serial_tau_to_parallel_policy_tau_np,
     serial_to_parallel_pos_np,
     set_initial_joint_state,
@@ -212,26 +214,72 @@ def _load_motion(path):
     return _load_motion_npz(path_str)
 
 
-def _build_goal(motion, idx, control_indices, obs_scales, zero_ref_motion=False):
+def _reference_feet_contact_from_motion(motion, idx, foot_contact_height_threshold=0.08):
+    contact = None
+    source = None
+    if "feet_contact" in motion:
+        contact = motion["feet_contact"][idx]
+        source = "feet_contact"
+    elif "ref_foot_contact" in motion:
+        contact = motion["ref_foot_contact"][idx]
+        source = "ref_foot_contact"
+    elif "foot_height" in motion:
+        contact = motion["foot_height"][idx] <= float(foot_contact_height_threshold)
+        source = "foot_height_fallback"
+
+    if contact is None:
+        if not getattr(_reference_feet_contact_from_motion, "_warned_missing_contact", False):
+            print(
+                "[sim2sim_dance][WARN] motion has no feet_contact/ref_foot_contact/foot_height; "
+                "using zero reference contact in goal obs.",
+                flush=True,
+            )
+            _reference_feet_contact_from_motion._warned_missing_contact = True
+        return np.zeros(2, dtype=np.float32)
+
+    contact = np.asarray(contact, dtype=np.float32).reshape(-1)[:2]
+    contact = (contact > 0.5).astype(np.float32)
+    if not getattr(_reference_feet_contact_from_motion, "_printed_source", False):
+        print(f"[sim2sim_dance] ref_feet_contact_source={source}, values are binarized 0/1", flush=True)
+        _reference_feet_contact_from_motion._printed_source = True
+    return contact
+
+
+def _build_goal(motion, idx, control_indices, obs_scales, zero_ref_motion=False, foot_contact_height_threshold=0.08):
     ref_dof = motion["dof_pos"][idx].astype(np.float64).copy()
-    ref_dof_pos_curr = ref_dof[np.asarray(control_indices, dtype=np.int64)].astype(np.float32)
+    control_indices_np = np.asarray(control_indices, dtype=np.int64)
+    ref_dof_pos_curr = ref_dof[control_indices_np].astype(np.float32)
+    ref_dof_vel_curr = motion["dof_vel"][idx][control_indices_np].astype(np.float32) * float(obs_scales.dof_vel)
     waist_quat = motion["waist_quat"][idx, 0]
     waist_rp = _quat_xyzw_to_euler(waist_quat)[:2].astype(np.float32)
     waist_linvel = motion["waist_vel"][idx, 0].astype(np.float32) * float(obs_scales.lin_vel)
     waist_angvel_z = motion["waist_ang_vel"][idx, 0, 2:3].astype(np.float32) * float(obs_scales.ang_vel)
     if zero_ref_motion:
+        ref_dof_vel_curr[:] = 0.0
         waist_linvel[:] = 0.0
         waist_angvel_z[:] = 0.0
+    ref_feet_contact = _reference_feet_contact_from_motion(
+        motion,
+        idx,
+        foot_contact_height_threshold=foot_contact_height_threshold,
+    )
     goal = np.concatenate(
         [
             ref_dof_pos_curr,
+            ref_dof_vel_curr,
             motion["waist_pos"][idx, 0, 2:3].astype(np.float32),
             waist_rp,
             waist_linvel,
             waist_angvel_z,
+            ref_feet_contact,
         ]
     ).astype(np.float32)
     return ref_dof, goal
+
+
+def _default_dof_pos_from_cfg(cfg):
+    default_angles = getattr(cfg.init_state, "default_joint_angles", {})
+    return np.asarray([float(default_angles.get(name, 0.0)) for name in SERIAL_DOF_JOINT_NAMES], dtype=np.float64)
 
 
 def _read_terminal_key():
@@ -349,6 +397,8 @@ def run_mujoco(policy, cfg):
     motion_length = int(motion["dof_pos"].shape[0])
     control_idx = np.asarray(cfg.env.num_control, dtype=np.int64)
     n_ctrl = len(control_idx)
+    default_dof_pos = _default_dof_pos_from_cfg(cfg)
+    foot_contact_height_threshold = float(getattr(cfg.motion, "foot_contact_height_threshold", 0.08))
 
     fourbar = init_fourbar_params()
     initial_ref_dof = motion["dof_pos"][0].astype(np.float64).copy()
@@ -363,7 +413,14 @@ def run_mujoco(policy, cfg):
     delayed_target_q_filter = np.zeros_like(action)
     action_delay_buffer = np.zeros((cfg.env.num_actions, cfg.sim_config.action_delay + 1), dtype=np.float64)
 
-    ref_dof_val, goal_buf = _build_goal(motion, 0, control_idx, cfg.normalization.obs_scales, zero_ref_motion=True)
+    ref_dof_val, goal_buf = _build_goal(
+        motion,
+        0,
+        control_idx,
+        cfg.normalization.obs_scales,
+        zero_ref_motion=True,
+        foot_contact_height_threshold=foot_contact_height_threshold,
+    )
     hold_ref_dof_val = ref_dof_val.copy()
     hold_goal_buf = goal_buf.copy()
     hold_first_frame = False
@@ -434,13 +491,14 @@ def run_mujoco(policy, cfg):
                 control_idx,
                 cfg.normalization.obs_scales,
                 zero_ref_motion=zero_ref_motion,
+                foot_contact_height_threshold=foot_contact_height_threshold,
             )
             if hold_first_frame:
                 ref_dof_val = hold_ref_dof_val.copy()
                 goal_buf = hold_goal_buf.copy()
 
             obs = np.zeros((1, cfg.env.num_single_obs), dtype=np.float32)
-            obs[0, 0:n_ctrl] = (q[control_idx] - ref_dof_val[control_idx]) * cfg.normalization.obs_scales.dof_pos
+            obs[0, 0:n_ctrl] = (q[control_idx] - default_dof_pos[control_idx]) * cfg.normalization.obs_scales.dof_pos
             obs[0, n_ctrl : 2 * n_ctrl] = dq[control_idx] * cfg.normalization.obs_scales.dof_vel
             obs[0, 2 * n_ctrl : 3 * n_ctrl] = action[control_idx]
             offset = 3 * n_ctrl
@@ -448,6 +506,20 @@ def run_mujoco(policy, cfg):
             obs[0, offset + 3 : offset + 6] = obs_euler * cfg.normalization.obs_scales.quat
 
             policy_input = np.concatenate((obs.reshape(-1), goal_buf)).reshape(1, -1).astype(np.float32)
+            if not getattr(cfg.sim_config, "_printed_obs_layout_warning", False):
+                print(
+                    "[sim2sim_dance] Observation layout changed: actor obs 61/73 -> 75. "
+                    "Old checkpoints and normalizer statistics are incompatible. "
+                    "Train from scratch or reset normalizer.",
+                    flush=True,
+                )
+                print(
+                    "[sim2sim_dance] observation shapes: "
+                    f"obs_now.shape={obs.shape}, goal_buf.shape={goal_buf.shape}, "
+                    f"actor obs.shape={policy_input.shape}",
+                    flush=True,
+                )
+                cfg.sim_config._printed_obs_layout_warning = True
             if policy_input.shape[1] != cfg.env.num_observations:
                 raise RuntimeError(
                     f"policy input dim mismatch: got {policy_input.shape[1]}, expected {cfg.env.num_observations}"
@@ -634,6 +706,14 @@ if __name__ == "__main__":
     args = parse_args()
 
     class Sim2simDanceCfg(MrobotMimicDanceCfg):
+        class init_state(MrobotMimicDanceCfg.init_state):
+            # Keep q-default_q observation identical to Lab dance training.
+            default_joint_angles = dict(MrobotMimicDanceLabCfg.init_state.default_joint_angles)
+
+        class normalization(MrobotMimicDanceCfg.normalization):
+            # Dance Lab training currently disables action interpolation/filtering.
+            actions_filter = False
+
         class sim_config:
             if args.terrain:
                 mujoco_model_path = f"{LEGGED_GYM_ROOT_DIR}/resources/robots/Mrobot/mjcf/mjmodel_terrain.xml"

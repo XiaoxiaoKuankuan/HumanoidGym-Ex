@@ -23,7 +23,6 @@ REQUIRED_TRAJECTORY_FIELDS = (
     "root_angvel",
     "euler_xyz",
     "foot_height",
-    "feet_contact",
     "pelvis_pos",
     "pelvis_vel",
     "pelvis_quat",
@@ -118,6 +117,7 @@ def load_mrobot_trajectory_library(
     device,
     required_fields=REQUIRED_TRAJECTORY_FIELDS,
     allow_legacy_keypoint_fallback=False,
+    foot_contact_height_threshold=0.08,
 ):
     resolved_files = [resolve_motion_file(path) for path in parse_motion_files(motion_files)]
     if not resolved_files:
@@ -154,10 +154,41 @@ def load_mrobot_trajectory_library(
         ]
         buffers[key] = torch.stack(tensors, dim=0)
 
+    if all(("ref_foot_contact" in motion) or ("feet_contact" in motion) for motion in raw_motions):
+        buffers["feet_contact"] = torch.stack(
+            [
+                (
+                    _pad_motion_tensor(
+                        motion,
+                        "feet_contact" if "feet_contact" in motion else "ref_foot_contact",
+                        max_length,
+                        device,
+                    )
+                    > 0.5
+                ).to(dtype=torch.float32)
+                for motion in raw_motions
+            ],
+            dim=0,
+        )
+        feet_contact_source = "data"
+    else:
+        buffers["feet_contact"] = (buffers["foot_height"] <= float(foot_contact_height_threshold)).to(dtype=torch.float32)
+        feet_contact_source = "height_fallback"
+
+    optional_buffers = {}
+    for key in ("ground_height", "env_origin_z"):
+        if all(key in motion for motion in raw_motions):
+            optional_buffers[key] = torch.stack(
+                [_pad_motion_tensor(motion, key, max_length, device) for motion in raw_motions],
+                dim=0,
+            )
+
     return SimpleNamespace(
         files=resolved_files,
         data_length=len(resolved_files),
         demo_length=max_length,
         demo_lengths=torch.tensor(motion_lengths, device=device, dtype=torch.long),
         buffers=buffers,
+        optional_buffers=optional_buffers,
+        feet_contact_source=feet_contact_source,
     )

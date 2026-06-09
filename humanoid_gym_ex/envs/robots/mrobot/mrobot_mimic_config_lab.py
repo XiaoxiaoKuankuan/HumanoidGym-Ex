@@ -127,7 +127,7 @@ class MrobotMimicLabCfg(MrobotMimicCommonLabCfg):
 
     class env(MrobotMimicBPMCfg.env):
         num_single_obs = 45
-        num_goal_obs = 19
+        num_goal_obs = 31
         num_observations = num_single_obs + num_goal_obs
         num_privileged_obs = 45 + 146 + num_goal_obs
         num_actions = 29
@@ -441,7 +441,7 @@ class MrobotMimicLabCfgPPO(MrobotMimicCommonLabCfgPPO):
             [0.8, 0.8, 0.8, 0.8, 1.2, 1.2, 0.8, 0.8, 0.8, 0.8, 1.2, 1.2]
         )
         num_single_obs = 45
-        num_goal_obs = 19
+        num_goal_obs = 31
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
 

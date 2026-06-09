@@ -598,6 +598,18 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         )
         if source == "trajectory":
             print(
+                "[HumanoidGym-Ex] Observation layout changed: Dance actor obs 61/73 -> 75, "
+                "critic obs 210/222 -> 197. "
+                "Old checkpoints and normalizer statistics are incompatible. "
+                "Train from scratch or reset normalizer.",
+                flush=True,
+            )
+            print(
+                "[HumanoidGym-Ex] MRobot Dance actor q observation uses q - default_q. "
+                "Old Dance checkpoints/normalizers from raw-q or q-ref-q observations are incompatible.",
+                flush=True,
+            )
+            print(
                 "[HumanoidGym-Ex] MRobot Dance motion files: "
                 + ", ".join([str(path) for path in getattr(self, "motion_files", [])]),
                 flush=True,
@@ -615,6 +627,13 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
                 f"max_episode_length_steps={self.max_episode_length}",
                 flush=True,
             )
+        else:
+            print(
+                "[HumanoidGym-Ex] Observation layout changed: actor obs 64 -> 76. "
+                "Old checkpoints and normalizer statistics are incompatible. "
+                "Train from scratch or reset normalizer.",
+                flush=True,
+            )
         print(
             "[HumanoidGym-Ex] MRobot body mapping: "
             f"base={self._body_names_from_indices(self.base_indices)}, "
@@ -623,6 +642,22 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             f"knee={self._body_names_from_indices(self.knee_indices)}, "
             f"hip={self._body_names_from_indices(self.hip_indices)}, "
             f"pelvic_yaw={self._body_names_from_indices(self.pelvic_yaw_indices)}",
+            flush=True,
+        )
+        print(
+            "[HumanoidGym-Ex] MRobot action preprocessing: "
+            f"actions_filter={bool(getattr(self.mrobot_cfg.normalization, 'actions_filter', False))}, "
+            f"action_delay={bool(getattr(self.mrobot_cfg.domain_rand, 'action_delay', False))}, "
+            f"action_delay_range={getattr(self.mrobot_cfg.domain_rand, 'action_delay_range', None)}, "
+            f"current_delay_ratio={float(getattr(self, '_current_delay_ratio', 0.0))}",
+            flush=True,
+        )
+        print(
+            "[HumanoidGym-Ex] MRobot tracking mapping: "
+            f"anchor_body={self._body_names_from_indices(torch.as_tensor([self.waist_body_id], device=self.device))}, "
+            f"tracking_body_count={len(self.all_tracking_indices)}, "
+            f"tracking_body_names={self._body_names_from_indices(self.all_tracking_indices)}, "
+            f"tracking_body_indices={self.all_tracking_indices.detach().cpu().tolist()}",
             flush=True,
         )
         sensor_body_names = list(getattr(self.contact_sensor, "body_names", []) or [])
@@ -812,7 +847,11 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         dr.randomize_motor_offset = self._target_randomize_motor_offset and motor_offset_ratio > 0.0
         dr.motor_offset_range = self._scale_zero_center_range(self._target_motor_offset_range, motor_offset_ratio)
         dr.action_delay = self._target_action_delay and delay_ratio > 0.0
-        dr.action_delay_range = self._scale_delay_range(self._target_action_delay_range, delay_ratio)
+        dr.action_delay_range = (
+            self._scale_delay_range(self._target_action_delay_range, delay_ratio)
+            if self._target_action_delay
+            else [0, 0]
+        )
         self._domain_rand_curriculum_stage = stage_idx
         if curriculum_mode == "adaptive" and stage_idx != previous_stage:
             self._adaptive_curriculum_stage_start_iteration = iteration
@@ -831,7 +870,7 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self._current_pd_ratio = pd_ratio
         self._current_motor_strength_ratio = motor_strength_ratio
         self._current_motor_offset_ratio = motor_offset_ratio
-        self._current_delay_ratio = delay_ratio
+        self._current_delay_ratio = delay_ratio if self._target_action_delay else 0.0
         all_env_ids = torch.arange(self.num_envs, device=self.device)
         self._randomize_reset_buffers(all_env_ids)
 
@@ -952,12 +991,17 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.ref_waist_vel = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.ref_waist_quat = self._identity_quat(1)
         self.ref_waist_ang_vel = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        self.tracking_ref_pos_buf = torch.zeros(self.num_envs, 10, 3, device=self.device)
-        self.tracking_ref_quat_buf = self._identity_quat(10)
-        self.tracking_ref_lin_vel_buf = torch.zeros(self.num_envs, 10, 3, device=self.device)
-        self.tracking_ref_ang_vel_buf = torch.zeros(self.num_envs, 10, 3, device=self.device)
+        self.tracking_ref_pos_buf = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.tracking_ref_quat_buf = self._identity_quat(1)
+        self.tracking_ref_lin_vel_buf = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.tracking_ref_ang_vel_buf = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.priv_tracking_ref_pos_buf = torch.zeros(self.num_envs, 10, 3, device=self.device)
+        self.priv_tracking_ref_quat_buf = self._identity_quat(10)
+        self.priv_tracking_ref_lin_vel_buf = torch.zeros(self.num_envs, 10, 3, device=self.device)
+        self.priv_tracking_ref_ang_vel_buf = torch.zeros(self.num_envs, 10, 3, device=self.device)
         self.ref_feet_contact = torch.zeros(self.num_envs, 2, device=self.device)
         self.ref_foot_height = torch.zeros(self.num_envs, 2, device=self.device)
+        self._use_feet_pos_z_for_ref_foot_height = False
         self.ref_root_linvel = torch.zeros(self.num_envs, 3, device=self.device)
         self.ref_root_angvel = torch.zeros(self.num_envs, 3, device=self.device)
         self.ref_euler_xyz = torch.zeros(self.num_envs, 3, device=self.device)
@@ -974,6 +1018,20 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.waist_indices = self._find_bodies_by_cfg_name(cfg.asset.waist_name)
         self.base_body_id = int(self.base_indices[0].item()) if len(self.base_indices) else 0
         self.waist_body_id = int(self.waist_indices[0].item()) if len(self.waist_indices) else self.base_body_id
+        self.priv_tracking_indices = torch.cat(
+            (self.base_indices, self.feet_indices, self.knee_indices, self.hip_indices, self.pelvic_yaw_indices, self.waist_indices),
+            dim=0,
+        ).long()
+        self._priv_tracking_pos_splits = (3, 6, 6, 6, 6, 3)
+        self._priv_tracking_quat_splits = (4, 8, 8, 8, 8, 4)
+        self.all_tracking_indices = self._resolve_reward_tracking_body_indices(getattr(cfg.asset, "tracking_body_names", None))
+        self.tracking_body_names = self._body_names_from_indices(self.all_tracking_indices)
+        self._tracking_ref_specs = self._make_tracking_ref_specs(self.all_tracking_indices)
+        self._priv_tracking_ref_specs = self._make_tracking_ref_specs(self.priv_tracking_indices)
+        self.tracking_ref_pos_buf = torch.zeros(self.num_envs, len(self.all_tracking_indices), 3, device=self.device)
+        self.tracking_ref_quat_buf = self._identity_quat(len(self.all_tracking_indices))
+        self.tracking_ref_lin_vel_buf = torch.zeros(self.num_envs, len(self.all_tracking_indices), 3, device=self.device)
+        self.tracking_ref_ang_vel_buf = torch.zeros(self.num_envs, len(self.all_tracking_indices), 3, device=self.device)
         self._validate_tracking_body_indices()
         termination_robot_indices = self._find_bodies_by_substrings(getattr(cfg.asset, "terminate_after_contacts_on", []))
         if len(termination_robot_indices) == 0:
@@ -997,12 +1055,6 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             penalized_robot_indices = self.termination_robot_indices
         self.penalized_robot_indices = penalized_robot_indices.long()
         self.penalised_contact_indices = self._contact_sensor_indices_for_robot_bodies(self.penalized_robot_indices)
-        self.all_tracking_indices = torch.cat(
-            (self.base_indices, self.feet_indices, self.knee_indices, self.hip_indices, self.pelvic_yaw_indices, self.waist_indices),
-            dim=0,
-        ).long()
-        self._tracking_pos_splits = (3, 6, 6, 6, 6, 3)
-        self._tracking_quat_splits = (4, 8, 8, 8, 8, 4)
         self._tracking_cache_valid = False
         self._tracking_cache_common_step = -1
         self.contact_forces = self.backend.get_contact_forces()
@@ -1123,7 +1175,8 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.time_out_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.policy_obs_buf = torch.zeros(self.num_envs, cfg.env.num_observations, device=self.device)
         self.privileged_obs_buf = torch.zeros(self.num_envs, cfg.env.num_privileged_obs, device=self.device)
-        self.priv_curr_buf = torch.zeros(self.num_envs, 146, device=self.device)
+        self.priv_curr_dim = int(cfg.env.num_privileged_obs - cfg.env.single_num_privileged_obs - cfg.env.num_goal_obs)
+        self.priv_curr_buf = torch.zeros(self.num_envs, self.priv_curr_dim, device=self.device)
         self.gravity_vec = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32, device=self.device).repeat(self.num_envs, 1)
         self.motion_bin_size_frames = 1
         self.motion_num_bins = torch.ones(1, dtype=torch.long, device=self.device)
@@ -1150,6 +1203,14 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         for label, (indices, count) in expected.items():
             if len(indices) != count:
                 bad.append(f"{label}: got {len(indices)}, expected {count}")
+        configured_tracking = list(getattr(self.mrobot_cfg.asset, "tracking_body_names", []) or [])
+        if configured_tracking and len(self.all_tracking_indices) != len(configured_tracking):
+            bad.append(
+                f"tracking_body_names: got {len(self.all_tracking_indices)}, "
+                f"expected {len(configured_tracking)}"
+            )
+        if len(torch.unique(self.all_tracking_indices)) != len(self.all_tracking_indices):
+            bad.append("tracking_body_names resolved to duplicate body indices")
         if bad:
             body_names = ", ".join(getattr(self.robot, "body_names", []))
             raise RuntimeError(
@@ -1159,6 +1220,72 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
                 + body_names
                 + "]"
             )
+
+    def _resolve_reward_tracking_body_indices(self, configured_names):
+        if not configured_names:
+            return self.priv_tracking_indices.clone()
+        body_names = list(getattr(self.robot, "body_names", []) or [])
+        ids = []
+        missing = []
+        for name in configured_names:
+            body_id = None
+            if name in body_names:
+                body_id = body_names.index(name)
+            else:
+                matches = [idx for idx, body_name in enumerate(body_names) if str(name) in body_name]
+                if len(matches) == 1:
+                    body_id = matches[0]
+                elif len(matches) > 1:
+                    missing.append(f"{name}: matched multiple bodies {[body_names[idx] for idx in matches]}")
+                else:
+                    missing.append(str(name))
+            if body_id is not None:
+                ids.append(body_id)
+        if missing:
+            raise RuntimeError(
+                "MRobot IsaacLab tracking_body_names could not be resolved uniquely: "
+                + "; ".join(missing)
+                + ". Imported body_names=["
+                + ", ".join(body_names)
+                + "]"
+            )
+        return torch.as_tensor(ids, dtype=torch.long, device=self.device)
+
+    @staticmethod
+    def _index_in_tensor(indices, body_id):
+        matches = (indices == int(body_id)).nonzero(as_tuple=False).flatten()
+        if len(matches) == 0:
+            return None
+        return int(matches[0].item())
+
+    def _tracking_ref_spec_for_body_id(self, body_id):
+        body_id = int(body_id)
+        part_idx = self._index_in_tensor(self.waist_indices, body_id)
+        if part_idx is not None:
+            return ("waist", part_idx)
+        part_idx = self._index_in_tensor(self.feet_indices, body_id)
+        if part_idx is not None:
+            return ("feet", part_idx)
+        part_idx = self._index_in_tensor(self.knee_indices, body_id)
+        if part_idx is not None:
+            return ("knee", part_idx)
+        part_idx = self._index_in_tensor(self.hip_indices, body_id)
+        if part_idx is not None:
+            return ("hip", part_idx)
+        part_idx = self._index_in_tensor(self.pelvic_yaw_indices, body_id)
+        if part_idx is not None:
+            return ("pelvic_yaw", part_idx)
+        part_idx = self._index_in_tensor(self.base_indices, body_id)
+        if part_idx is not None:
+            # The legacy privileged keypoint block uses base_link as the
+            # simulated pelvis/root body and compares it to pelvis reference.
+            return ("pelvis", 0)
+        body_names = list(getattr(self.robot, "body_names", []) or [])
+        body_name = body_names[body_id] if 0 <= body_id < len(body_names) else f"<body:{body_id}>"
+        raise RuntimeError(f"No reference keypoint mapping exists for tracking body {body_name}.")
+
+    def _make_tracking_ref_specs(self, indices):
+        return [self._tracking_ref_spec_for_body_id(body_id) for body_id in indices.detach().cpu().tolist()]
 
     def _contact_sensor_indices_for_robot_bodies(self, robot_body_ids):
         sensor_body_names = list(getattr(self.contact_sensor, "body_names", []) or [])
@@ -1642,8 +1769,10 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             motion_files,
             self.device,
             allow_legacy_keypoint_fallback=bool(getattr(motion_cfg, "allow_legacy_keypoint_fallback", False)),
+            foot_contact_height_threshold=float(getattr(motion_cfg, "foot_contact_height_threshold", 0.08)),
         )
         self.motion_files = library.files
+        self.feet_contact_source = getattr(library, "feet_contact_source", "unknown")
         self.data_length = library.data_length
         self.demo_length = library.demo_length
         self.demo_lengths = library.demo_lengths
@@ -1680,6 +1809,7 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.waist_vel_buffer = buffers["waist_vel"]
         self.waist_quat_buffer = _quat_xyzw_to_wxyz(buffers["waist_quat"])
         self.waist_ang_vel_buffer = buffers["waist_ang_vel"]
+        self._check_trajectory_foot_height_semantics(getattr(library, "optional_buffers", {}))
         self._init_adaptive_phase_sampling()
         print("[mrobot_dance][IsaacLab] 指定轨迹 reference 加载完成", flush=True)
         print(f"[mrobot_dance][IsaacLab] 轨迹数量: {self.data_length}", flush=True)
@@ -1695,6 +1825,40 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             f"num_bins={[int(x) for x in self.motion_num_bins.detach().cpu().tolist()]}",
             flush=True,
         )
+        print(f"[mrobot_dance][IsaacLab] feet_contact_source={self.feet_contact_source}", flush=True)
+
+    def _check_trajectory_foot_height_semantics(self, optional_buffers=None):
+        foot_height = self.foot_height_buffer
+        feet_pos_z = self.feet_pos_buffer[..., 2]
+        diff = torch.abs(foot_height - feet_pos_z)
+        mean_abs = float(diff.mean().item())
+        max_abs = float(diff.max().item())
+        self._use_feet_pos_z_for_ref_foot_height = mean_abs > 1e-4
+        message = (
+            "[mrobot_dance][IsaacLab] foot_height check: "
+            f"mean_abs_diff(foot_height, feet_pos[...,2])={mean_abs:.8f}, "
+            f"max_abs_diff={max_abs:.8f}, "
+            f"foot_height_minmax=({float(foot_height.min().item()):.6f}, {float(foot_height.max().item()):.6f}), "
+            f"feet_pos_z_minmax=({float(feet_pos_z.min().item()):.6f}, {float(feet_pos_z.max().item()):.6f})"
+        )
+        optional_buffers = optional_buffers or {}
+        for key in ("ground_height", "env_origin_z"):
+            value = optional_buffers.get(key)
+            if value is not None:
+                message += f", {key}_minmax=({float(value.min().item()):.6f}, {float(value.max().item()):.6f})"
+        print(message, flush=True)
+        if self._use_feet_pos_z_for_ref_foot_height:
+            print(
+                "[mrobot_dance][IsaacLab] WARNING: foot_height and feet_pos[...,2] differ. "
+                "Using ref_feet_pos[...,2] as ref_foot_height so foot-height reward compares world z to world z.",
+                flush=True,
+            )
+        else:
+            print(
+                "[mrobot_dance][IsaacLab] foot_height matches feet_pos[...,2]; "
+                "foot-height reward compares world z to world z.",
+                flush=True,
+            )
 
     def _build_dof_column_indices(self, suffix):
         reverse_alias = {env_name: data_name for data_name, env_name in JOINT_NAME_ALIASES.items()}
@@ -1804,7 +1968,10 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self.ref_waist_quat[:] = self.waist_quat_buffer[self.ref_idx, phase_ids]
         self.ref_waist_ang_vel[:] = self.waist_ang_vel_buffer[self.ref_idx, phase_ids]
         self.ref_feet_contact[:] = self.feet_contact_buffer[self.ref_idx, phase_ids]
-        self.ref_foot_height[:] = self.foot_height_buffer[self.ref_idx, phase_ids]
+        if getattr(self, "_use_feet_pos_z_for_ref_foot_height", False):
+            self.ref_foot_height[:] = self.ref_feet_pos[..., 2]
+        else:
+            self.ref_foot_height[:] = self.foot_height_buffer[self.ref_idx, phase_ids]
         self.ref_root_linvel[:] = self.root_linvel_buffer[self.ref_idx, phase_ids]
         self.ref_root_angvel[:] = self.root_angvel_buffer[self.ref_idx, phase_ids]
         self.ref_euler_xyz[:] = self.euler_xyz_buffer[self.ref_idx, phase_ids]
@@ -1812,34 +1979,44 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         self._refresh_tracking_ref_buffers()
 
     def _refresh_tracking_ref_buffers(self):
-        self.tracking_ref_pos_buf[:, 0:1] = self.ref_pelvis_pos
-        self.tracking_ref_pos_buf[:, 1:3] = self.ref_feet_pos
-        self.tracking_ref_pos_buf[:, 3:5] = self.ref_knee_pos
-        self.tracking_ref_pos_buf[:, 5:7] = self.ref_hip_pos
-        self.tracking_ref_pos_buf[:, 7:9] = self.ref_pelvic_yaw_pos
-        self.tracking_ref_pos_buf[:, 9:10] = self.ref_waist_pos
-
-        self.tracking_ref_quat_buf[:, 0:1] = self.ref_pelvis_quat
-        self.tracking_ref_quat_buf[:, 1:3] = self.ref_feet_quat
-        self.tracking_ref_quat_buf[:, 3:5] = self.ref_knee_quat
-        self.tracking_ref_quat_buf[:, 5:7] = self.ref_hip_quat
-        self.tracking_ref_quat_buf[:, 7:9] = self.ref_pelvic_yaw_quat
-        self.tracking_ref_quat_buf[:, 9:10] = self.ref_waist_quat
-
-        self.tracking_ref_lin_vel_buf[:, 0:1] = self.ref_pelvis_vel
-        self.tracking_ref_lin_vel_buf[:, 1:3] = self.ref_feet_vel
-        self.tracking_ref_lin_vel_buf[:, 3:5] = self.ref_knee_vel
-        self.tracking_ref_lin_vel_buf[:, 5:7] = self.ref_hip_vel
-        self.tracking_ref_lin_vel_buf[:, 7:9] = self.ref_pelvic_yaw_vel
-        self.tracking_ref_lin_vel_buf[:, 9:10] = self.ref_waist_vel
-
-        self.tracking_ref_ang_vel_buf[:, 0:1] = self.ref_pelvis_ang_vel
-        self.tracking_ref_ang_vel_buf[:, 1:3] = self.ref_feet_ang_vel
-        self.tracking_ref_ang_vel_buf[:, 3:5] = self.ref_knee_ang_vel
-        self.tracking_ref_ang_vel_buf[:, 5:7] = self.ref_hip_ang_vel
-        self.tracking_ref_ang_vel_buf[:, 7:9] = self.ref_pelvic_yaw_ang_vel
-        self.tracking_ref_ang_vel_buf[:, 9:10] = self.ref_waist_ang_vel
+        self._fill_tracking_ref_buffers(
+            self.tracking_ref_pos_buf,
+            self.tracking_ref_quat_buf,
+            self.tracking_ref_lin_vel_buf,
+            self.tracking_ref_ang_vel_buf,
+            self._tracking_ref_specs,
+        )
+        self._fill_tracking_ref_buffers(
+            self.priv_tracking_ref_pos_buf,
+            self.priv_tracking_ref_quat_buf,
+            self.priv_tracking_ref_lin_vel_buf,
+            self.priv_tracking_ref_ang_vel_buf,
+            self._priv_tracking_ref_specs,
+        )
         self._tracking_cache_valid = False
+
+    def _ref_tensors_for_kind(self, kind):
+        if kind == "pelvis":
+            return self.ref_pelvis_pos, self.ref_pelvis_quat, self.ref_pelvis_vel, self.ref_pelvis_ang_vel
+        if kind == "feet":
+            return self.ref_feet_pos, self.ref_feet_quat, self.ref_feet_vel, self.ref_feet_ang_vel
+        if kind == "knee":
+            return self.ref_knee_pos, self.ref_knee_quat, self.ref_knee_vel, self.ref_knee_ang_vel
+        if kind == "hip":
+            return self.ref_hip_pos, self.ref_hip_quat, self.ref_hip_vel, self.ref_hip_ang_vel
+        if kind == "pelvic_yaw":
+            return self.ref_pelvic_yaw_pos, self.ref_pelvic_yaw_quat, self.ref_pelvic_yaw_vel, self.ref_pelvic_yaw_ang_vel
+        if kind == "waist":
+            return self.ref_waist_pos, self.ref_waist_quat, self.ref_waist_vel, self.ref_waist_ang_vel
+        raise RuntimeError(f"Unknown tracking reference kind: {kind}")
+
+    def _fill_tracking_ref_buffers(self, pos_buf, quat_buf, lin_vel_buf, ang_vel_buf, specs):
+        for out_idx, (kind, part_idx) in enumerate(specs):
+            ref_pos, ref_quat, ref_vel, ref_ang_vel = self._ref_tensors_for_kind(kind)
+            pos_buf[:, out_idx] = ref_pos[:, part_idx]
+            quat_buf[:, out_idx] = ref_quat[:, part_idx]
+            lin_vel_buf[:, out_idx] = ref_vel[:, part_idx]
+            ang_vel_buf[:, out_idx] = ref_ang_vel[:, part_idx]
 
     def _advance_reference_phase(self):
         if self._uses_trajectory_reference():
@@ -2123,7 +2300,12 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
                 flush=True,
             )
             print(
-                "[MRobot keypoint debug] ref_order=pelvis, feet[2], knee[2], hip[2], pelvic_yaw[2], waist",
+                "[MRobot keypoint debug] ref_order follows tracking_body_names",
+                flush=True,
+            )
+            print(
+                "[MRobot keypoint debug] ref_specs="
+                + ", ".join([f"{kind}[{part_idx}]" for kind, part_idx in self._tracking_ref_specs]),
                 flush=True,
             )
             print(
@@ -2251,64 +2433,23 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         anchor_pos_w, anchor_quat_w = self._get_current_anchor_pose()
         anchor_pos_local, _ = self._get_current_anchor_pose_local()
         tracking_p_b, tracking_q_b = self.get_rel_pose(self.all_tracking_indices, anchor_pos_w, anchor_quat_w)
-        (
-            self.pelvis_p_b,
-            self.feet_p_b,
-            self.knee_p_b,
-            self.hip_p_b,
-            self.pelvic_yaw_p_b,
-            self.waist_p_b,
-        ) = torch.split(tracking_p_b, self._tracking_pos_splits, dim=1)
-        (
-            self.pelvis_q_b,
-            self.feet_q_b,
-            self.knee_q_b,
-            self.hip_q_b,
-            self.pelvic_yaw_q_b,
-            self.waist_q_b,
-        ) = torch.split(tracking_q_b, self._tracking_quat_splits, dim=1)
         ref_p0, ref_q0 = self.get_ref_rel_state_current(self._tracking_ref_pos(), self._tracking_ref_quat())
-        (
-            self.pelvis_p0,
-            self.f_p0,
-            self.k_p0,
-            self.h_p0,
-            self.pelvic_yaw_p0,
-            self.waist_p0,
-        ) = torch.split(ref_p0, self._tracking_pos_splits, dim=1)
-        (
-            self.pelvis_q0,
-            self.f_q0,
-            self.k_q0,
-            self.h_q0,
-            self.pelvic_yaw_q0,
-            self.waist_q0,
-        ) = torch.split(ref_q0, self._tracking_quat_splits, dim=1)
+        num_tracking_parts = len(self.all_tracking_indices)
         ref_anchor_pos = self.ref_waist_pos[:, 0, :]
         ref_anchor_quat = self.ref_waist_quat[:, 0, :]
         anchor_pos_b = _quat_rotate_inverse_wxyz(anchor_quat_w, ref_anchor_pos - anchor_pos_local)
         anchor_quat_b = _quat_mul_wxyz(_quat_conjugate_wxyz(anchor_quat_w), ref_anchor_quat)
         anchor_ori_b = _matrix_from_quat_wxyz(anchor_quat_b)[..., :2].reshape(self.num_envs, -1)
-        pelvis_err_p = self.pelvis_p_b - self.pelvis_p0
-        feet_err_p = self.feet_p_b - self.f_p0
-        knee_err_p = self.knee_p_b - self.k_p0
-        hip_err_p = self.hip_p_b - self.h_p0
-        pelvic_yaw_err_p = self.pelvic_yaw_p_b - self.pelvic_yaw_p0
-        waist_err_p = self.waist_p_b - self.waist_p0
-        pelvis_err_q = self._quat_err_6d(self.pelvis_q_b, self.pelvis_q0, 1)
-        feet_err_q = self._quat_err_6d(self.feet_q_b, self.f_q0, 2)
-        knee_err_q = self._quat_err_6d(self.knee_q_b, self.k_q0, 2)
-        hip_err_q = self._quat_err_6d(self.hip_q_b, self.h_q0, 2)
-        pelvic_yaw_err_q = self._quat_err_6d(self.pelvic_yaw_q_b, self.pelvic_yaw_q0, 2)
-        waist_err_q = self._quat_err_6d(self.waist_q_b, self.waist_q0, 1)
+        tracking_err_p = tracking_p_b - ref_p0
+        tracking_err_q = self._quat_err_6d(tracking_q_b, ref_q0, num_tracking_parts)
         if getattr(self.mrobot_cfg.domain_rand, "sys_delay", False) and self.obs_imu_delay_buffer is not None:
             root_states_obs, dof_pos_vel_obs = self._get_sys_delayed_obs_state()
-            q = (dof_pos_vel_obs[:, : self.mrobot_cfg.env.num_actions] - self.ref_dof_pos) * self.obs_scales.dof_pos
+            q = (dof_pos_vel_obs[:, : self.mrobot_cfg.env.num_actions] - self.default_dof_pos) * self.obs_scales.dof_pos
             dq = dof_pos_vel_obs[:, self.mrobot_cfg.env.num_actions :] * self.obs_scales.dof_vel
             base_ang_vel_obs = _quat_rotate_inverse_wxyz(root_states_obs[:, 3:7], root_states_obs[:, 10:13])
             base_euler_obs = _quat_wxyz_to_euler_xyz(root_states_obs[:, 3:7])
         else:
-            q = (self.dof_pos - self.ref_dof_pos) * self.obs_scales.dof_pos
+            q = (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos
             dq = self.dof_vel * self.obs_scales.dof_vel
             base_ang_vel_obs = self.base_ang_vel
             base_euler_obs = self.base_euler_xyz[:, 0:3]
@@ -2327,16 +2468,17 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
             dim=-1,
         )
         ref_waist_euler = _quat_wxyz_to_euler_xyz(self.ref_waist_quat[:, 0, :])
-        goal_buf = torch.cat(
-            (
-                self.ref_dof_pos[:, self.num_control] * self.obs_scales.dof_pos,
-                self.ref_waist_pos[:, 0, 2:3],
-                ref_waist_euler[:, 0:2],
-                self.ref_waist_vel[:, 0, :] * self.obs_scales.lin_vel,
-                self.ref_waist_ang_vel[:, 0, 2:3] * self.obs_scales.ang_vel,
-            ),
-            dim=-1,
-        )
+        goal_terms = [
+            self.ref_dof_pos[:, self.num_control] * self.obs_scales.dof_pos,
+            self.ref_dof_vel[:, self.num_control] * self.obs_scales.dof_vel,
+            self.ref_waist_pos[:, 0, 2:3],
+            ref_waist_euler[:, 0:2],
+            self.ref_waist_vel[:, 0, :] * self.obs_scales.lin_vel,
+            self.ref_waist_ang_vel[:, 0, 2:3] * self.obs_scales.ang_vel,
+        ]
+        if int(getattr(self.mrobot_cfg.env, "num_goal_obs", 31)) >= 33:
+            goal_terms.append(self.ref_feet_contact.float())
+        goal_buf = torch.cat(goal_terms, dim=-1)
         if self.mrobot_cfg.noise.add_noise:
             obs_now = obs_now + (2.0 * torch.rand_like(obs_now) - 1.0) * self.noise_scale_vec * self.mrobot_cfg.noise.noise_level
         self.policy_obs_buf[:, : self.mrobot_cfg.env.num_single_obs] = obs_now
@@ -2360,38 +2502,70 @@ class MrobotMimicIsaacLabEnv(DirectRLEnv):
         priv_curr[:, 3:9] = anchor_ori_b
         priv_curr[:, 9:12] = (self.base_lin_vel - self.ref_root_linvel) * self.obs_scales.lin_vel
         priv_curr[:, 12:15] = (self.base_ang_vel - self.ref_root_angvel) * self.obs_scales.ang_vel
-        priv_curr[:, 15:18] = pelvis_err_p
-        priv_curr[:, 18:24] = pelvis_err_q
-        priv_curr[:, 24:30] = feet_err_p
-        priv_curr[:, 30:42] = feet_err_q
-        priv_curr[:, 42:48] = knee_err_p
-        priv_curr[:, 48:60] = knee_err_q
-        priv_curr[:, 60:66] = hip_err_p
-        priv_curr[:, 66:78] = hip_err_q
-        priv_curr[:, 78:84] = pelvic_yaw_err_p
-        priv_curr[:, 84:96] = pelvic_yaw_err_q
-        priv_curr[:, 96:99] = waist_err_p
-        priv_curr[:, 99:105] = waist_err_q
+        cursor = 15
+        tracking_pos_dim = num_tracking_parts * 3
+        tracking_quat_dim = num_tracking_parts * 6
+        priv_curr[:, cursor : cursor + tracking_pos_dim] = tracking_err_p
+        cursor += tracking_pos_dim
+        priv_curr[:, cursor : cursor + tracking_quat_dim] = tracking_err_q
+        cursor += tracking_quat_dim
         dr = self.mrobot_cfg.domain_rand
-        priv_curr[:, 105:107] = self.rand_push_force[:, :2] / max(float(getattr(dr, "max_push_vel_xy", 1.0)), 1e-6)
-        priv_curr[:, 107:110] = self.rand_push_torque / max(float(getattr(dr, "max_push_ang_vel", 1.0)), 1e-6)
-        priv_curr[:, 110:113] = self.disturbance_force[:, 0, :] / max(abs(float(getattr(dr, "disturbance_range", [-1.0, 1.0])[1])), 1e-6)
+        priv_curr[:, cursor : cursor + 2] = self.rand_push_force[:, :2] / max(float(getattr(dr, "max_push_vel_xy", 1.0)), 1e-6)
+        cursor += 2
+        priv_curr[:, cursor : cursor + 3] = self.rand_push_torque / max(float(getattr(dr, "max_push_ang_vel", 1.0)), 1e-6)
+        cursor += 3
+        priv_curr[:, cursor : cursor + 3] = self.disturbance_force[:, 0, :] / max(
+            abs(float(getattr(dr, "disturbance_range", [-1.0, 1.0])[1])), 1e-6
+        )
+        cursor += 3
         friction_range = getattr(dr, "static_friction_range", getattr(dr, "friction_range", [0.0, 1.0]))
         restitution_range = getattr(dr, "restitution_range", [0.0, 1.0])
-        priv_curr[:, 113:114] = (self.friction_coeffs - friction_range[0]) / max(float(friction_range[1] - friction_range[0]), 1e-6)
-        priv_curr[:, 114:115] = (self.restitution_coeffs - restitution_range[0]) / max(
+        priv_curr[:, cursor : cursor + 1] = (self.friction_coeffs - friction_range[0]) / max(
+            float(friction_range[1] - friction_range[0]), 1e-6
+        )
+        cursor += 1
+        priv_curr[:, cursor : cursor + 1] = (self.restitution_coeffs - restitution_range[0]) / max(
             float(restitution_range[1] - restitution_range[0]), 1e-6
         )
-        priv_curr[:, 115:127] = (self.Kp_factors[:, self.num_control] - dr.kp_range[0]) / max(float(dr.kp_range[1] - dr.kp_range[0]), 1e-6)
-        priv_curr[:, 127:139] = (self.Kd_factors[:, self.num_control] - dr.kd_range[0]) / max(float(dr.kd_range[1] - dr.kd_range[0]), 1e-6)
+        cursor += 1
+        priv_curr[:, cursor : cursor + 12] = (self.Kp_factors[:, self.num_control] - dr.kp_range[0]) / max(
+            float(dr.kp_range[1] - dr.kp_range[0]), 1e-6
+        )
+        cursor += 12
+        priv_curr[:, cursor : cursor + 12] = (self.Kd_factors[:, self.num_control] - dr.kd_range[0]) / max(
+            float(dr.kd_range[1] - dr.kd_range[0]), 1e-6
+        )
+        cursor += 12
         payload_range = getattr(dr, "payload_mass_range", [0.0, 1.0])
-        priv_curr[:, 139:140] = (self.payload - payload_range[0]) / max(float(payload_range[1] - payload_range[0]), 1e-6)
-        priv_curr[:, 140:143] = self.com_displacement * self.obs_scales.com_pos
-        priv_curr[:, -3:-1] = 1.0 - self.ref_feet_contact
-        priv_curr[:, -1:] = self._get_privileged_reference_phase_obs()
+        priv_curr[:, cursor : cursor + 1] = (self.payload - payload_range[0]) / max(float(payload_range[1] - payload_range[0]), 1e-6)
+        cursor += 1
+        priv_curr[:, cursor : cursor + 3] = self.com_displacement * self.obs_scales.com_pos
+        cursor += 3
+        priv_curr[:, cursor : cursor + 2] = 1.0 - self.ref_feet_contact
+        cursor += 2
+        priv_curr[:, cursor : cursor + 1] = self._get_privileged_reference_phase_obs()
+        cursor += 1
+        if cursor != self.priv_curr_dim:
+            raise RuntimeError(f"MRobot IsaacLab privileged current dim mismatch: filled={cursor}, cfg={self.priv_curr_dim}")
         self.privileged_obs_buf[:, :45] = priv_hist
-        self.privileged_obs_buf[:, 45:191] = priv_curr
-        self.privileged_obs_buf[:, 191:] = goal_buf
+        self.privileged_obs_buf[:, 45 : 45 + self.priv_curr_dim] = priv_curr
+        self.privileged_obs_buf[:, 45 + self.priv_curr_dim :] = goal_buf
+        if not getattr(self, "_printed_observation_layout_shapes", False):
+            print(
+                "[HumanoidGym-Ex] Observation layout changed: Dance actor obs 61/73 -> 75 "
+                "or BPM actor obs 64 -> 76. "
+                "Old checkpoints and normalizer statistics are incompatible. "
+                "Train from scratch or reset normalizer.",
+                flush=True,
+            )
+            print(
+                "[HumanoidGym-Ex] MRobot IsaacLab observation shapes: "
+                f"obs_now.shape={tuple(obs_now.shape)}, goal_buf.shape={tuple(goal_buf.shape)}, "
+                f"actor obs.shape={tuple(self.policy_obs_buf.shape)}, "
+                f"privileged obs.shape={tuple(self.privileged_obs_buf.shape)}",
+                flush=True,
+            )
+            self._printed_observation_layout_shapes = True
         if self.policy_obs_buf.shape[1] != self.mrobot_cfg.env.num_observations:
             raise RuntimeError(
                 f"MRobot IsaacLab obs dim mismatch: got {self.policy_obs_buf.shape[1]}, "

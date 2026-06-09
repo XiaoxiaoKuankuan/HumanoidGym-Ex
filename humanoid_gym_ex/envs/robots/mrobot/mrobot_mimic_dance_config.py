@@ -18,12 +18,14 @@ class MrobotMimicDanceCfg(MrobotMimicCommonCfg):
         frame_stack = 1
         c_frame_stack = 1
         # Dance policy proprio obs excludes waist and base linear velocity:
-        # 12 q error + 12 dq + 12 last action + 3 base angular velocity + 3 euler.
+        # 12 q + 12 dq + 12 last action + 3 base angular velocity + 3 euler.
         num_single_obs = 42
-        num_goal_obs = 19
+        # ref_dof_pos(12)+ref_dof_vel(12)+waist_z(1)+waist_rp(2)+waist_vel(3)+waist_angvel_z(1)+ref_feet_contact(2).
+        num_goal_obs = 33
         num_observations = num_single_obs + num_goal_obs
         single_num_privileged_obs = 45
-        num_privileged_obs = 45 + 146 + num_goal_obs
+        # Current privileged block tracks the same 7 body keypoints as whole-body rewards.
+        num_privileged_obs = 45 + 119 + num_goal_obs
         num_actions = 29
         num_policy_actions = 12
         num_control = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
@@ -49,6 +51,15 @@ class MrobotMimicDanceCfg(MrobotMimicCommonCfg):
             "{LEGGED_GYM_ROOT_DIR}/resources/robots/CASBOT02_ENCOS_7dof_shell_20251015/"
             "Serial/urdf/CASBOT02_ENCOS_7dof_shell_20251015_guitar.urdf"
         )
+        tracking_body_names = [
+            "waist_yaw_link",
+            "left_leg_pelvic_roll_link",
+            "left_leg_knee_pitch_link",
+            "left_leg_ankle_roll_link",
+            "right_leg_pelvic_roll_link",
+            "right_leg_knee_pitch_link",
+            "right_leg_ankle_roll_link",
+        ]
 
     class control(MrobotMimicCommonCfg.control):
         action_scale = 0.25
@@ -136,7 +147,7 @@ class MrobotMimicDanceCfgPPO(MrobotMimicCommonCfgPPO):
     class policy(MrobotMimicCommonCfgPPO.policy):
         init_noise_std = np.array([0.8, 0.8, 0.8, 0.8, 1.2, 1.2, 0.8, 0.8, 0.8, 0.8, 1.2, 1.2])
         num_single_obs = 42
-        num_goal_obs = 19
+        num_goal_obs = 33
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
 

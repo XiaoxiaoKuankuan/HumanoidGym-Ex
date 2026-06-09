@@ -103,8 +103,8 @@ class MrobotMimicCommonCfg(LeggedRobotCfg):
         d_frame_stack = 10
         # Actor 只控制腿部 12 个关节，不再控制腰。
         num_single_obs = 45
-        # ref_dof_pos(12)+waist_z(1)+waist_rp(2)+waist_vel(3)+waist_angvel_z(1)
-        num_goal_obs = 19
+        # ref_dof_pos(12)+ref_dof_vel(12)+waist_z(1)+waist_rp(2)+waist_vel(3)+waist_angvel_z(1)
+        num_goal_obs = 31
         num_observations = num_single_obs + num_goal_obs
         single_num_privileged_obs = 45  # height(1)+roll_pitch(2)+dof_pos(12)+dof_vel(12)+act(12)+linvel(3)+angvel(3)
         num_privileged_obs = 45 + 146 + num_goal_obs  # 当前 priv_hist_part + priv_curr + 当前 goal
@@ -935,7 +935,7 @@ class MrobotMimicCommonCfgPPO(LeggedRobotCfgPPO):
                                    0.8, 0.8, 0.8, 0.8, 1.2, 1.2])*1
         # init_noise_std = -1.
         num_single_obs = 45
-        num_goal_obs = 19  # 与 env.num_goal_obs 保持一致
+        num_goal_obs = 31  # 与 env.num_goal_obs 保持一致
         actor_hidden_dims = [512, 256, 128]
         # critic_hidden_dims = [768, 256, 128]
         critic_hidden_dims = [512, 256, 128]

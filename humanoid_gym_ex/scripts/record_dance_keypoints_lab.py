@@ -79,6 +79,8 @@ def _parse_args():
     parser.add_argument("--allow_missing", action="store_true", help="Skip missing default files.")
     parser.add_argument("--prepend_stand_s", type=float, default=0.0, help="Prepend still frames after recording.")
     parser.add_argument("--append_stand_s", type=float, default=0.0, help="Append still frames after recording.")
+    parser.add_argument("--contact_height_threshold", type=float, default=0.075, help="Fallback foot-z threshold for 0/1 contact.")
+    parser.add_argument("--contact_force_threshold", type=float, default=1.0, help="IsaacLab foot contact force-z threshold.")
     parser.add_argument(
         "--show_cpu_governor_warning",
         action="store_true",
@@ -356,7 +358,35 @@ def _init_buffers():
     return buffers
 
 
-def _collect_for_file(env, data_pos, data_dt, render=False, data_stride=1):
+def _binarize_contact(contact):
+    return (np.asarray(contact, dtype=np.float32) > 0.5).astype(np.float32)
+
+
+def _read_reference_feet_contact(env, data_pos, src_idx, rigid, contact_height_threshold=0.075, contact_force_threshold=1.0):
+    if data_pos.shape[1] >= 63:
+        return _binarize_contact(data_pos[src_idx, -2:]), "data"
+
+    try:
+        if len(env.feet_contact_indices) == 2:
+            contact_forces = env.backend.get_contact_forces()
+            contact_force_z = contact_forces[0, env.feet_contact_indices, 2].detach().cpu().numpy()
+            return (contact_force_z > float(contact_force_threshold)).astype(np.float32), "isaaclab_contact_force"
+    except Exception:
+        pass
+
+    feet_z = rigid[0, env.feet_indices, 2].detach().cpu().numpy()
+    return (feet_z < float(contact_height_threshold)).astype(np.float32), "height_fallback"
+
+
+def _collect_for_file(
+    env,
+    data_pos,
+    data_dt,
+    render=False,
+    data_stride=1,
+    contact_height_threshold=0.075,
+    contact_force_threshold=1.0,
+):
     env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
     default_joint_pos = env.robot.data.default_joint_pos[0:1].clone()
     default_joint_vel = env.robot.data.default_joint_vel[0:1].clone()
@@ -364,6 +394,7 @@ def _collect_for_file(env, data_pos, data_dt, render=False, data_stride=1):
     last_dof_pos = None
     last_root = None
     last_rpy = None
+    contact_source_counts = {}
     data_stride = max(1, int(data_stride))
 
     sample_indices = range(0, data_pos.shape[0], data_stride)
@@ -418,12 +449,17 @@ def _collect_for_file(env, data_pos, data_dt, render=False, data_stride=1):
             buffers[f"{field_name}_vel"].append(state[:, 7:10])
             buffers[f"{field_name}_ang_vel"].append(state[:, 10:13])
 
-        feet_z = rigid[0, env.feet_indices, 2].detach().cpu().numpy()
-        buffers["feet_contact"].append((feet_z < 0.075).astype(np.float32))
-        if data_pos.shape[1] >= 63:
-            buffers["ref_foot_contact"].append(data_pos[src_idx, -2:].astype(np.float32))
-        else:
-            buffers["ref_foot_contact"].append(np.zeros(2, dtype=np.float32))
+        feet_contact, contact_source = _read_reference_feet_contact(
+            env,
+            data_pos,
+            src_idx,
+            rigid,
+            contact_height_threshold=contact_height_threshold,
+            contact_force_threshold=contact_force_threshold,
+        )
+        contact_source_counts[contact_source] = contact_source_counts.get(contact_source, 0) + 1
+        buffers["feet_contact"].append(feet_contact)
+        buffers["ref_foot_contact"].append(feet_contact.copy())
 
         if render:
             env.sim.render()
@@ -439,6 +475,7 @@ def _collect_for_file(env, data_pos, data_dt, render=False, data_stride=1):
         buffers["root_states"][0, 7:13] = 0.0
         buffers["root_linvel"][0] = 0.0
         buffers["root_angvel"][0] = 0.0
+    print(f"[record_dance_keypoints_lab] feet_contact source counts: {contact_source_counts}", flush=True)
     return buffers
 
 
@@ -479,7 +516,7 @@ def _apply_still_segments(ref_np, prepend_frames, append_frames):
     for key in list(ref_np.keys()):
         zero_all = key in zero_all_keys
         zero_slice = (slice(7, 13),) if key == "root_states" else None
-        fill_value = 1.0 if key == "feet_contact" else 0.0 if key == "ref_foot_contact" else None
+        fill_value = 1.0 if key in ("feet_contact", "ref_foot_contact") else None
         ref_np[key] = _repeat_frame(ref_np[key], prepend_frames, first=True, zero_all=zero_all, zero_slice=zero_slice, fill_value=fill_value)
         ref_np[key] = _repeat_frame(ref_np[key], append_frames, first=False, zero_all=zero_all, zero_slice=zero_slice, fill_value=fill_value)
     return ref_np
@@ -553,7 +590,15 @@ def record_dance_keypoints(args):
             if not os.path.isfile(input_path):
                 continue
             data = _read_data(input_path)
-            ref_np = _collect_for_file(env, data, args.data_dt, render=args.render, data_stride=args.data_stride)
+            ref_np = _collect_for_file(
+                env,
+                data,
+                args.data_dt,
+                render=args.render,
+                data_stride=args.data_stride,
+                contact_height_threshold=args.contact_height_threshold,
+                contact_force_threshold=args.contact_force_threshold,
+            )
             prepend_frames = int(round(args.prepend_stand_s / args.data_dt))
             append_frames = int(round(args.append_stand_s / args.data_dt))
             ref_np = _apply_still_segments(ref_np, prepend_frames, append_frames)

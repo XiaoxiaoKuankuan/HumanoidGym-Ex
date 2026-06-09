@@ -106,17 +106,19 @@ class MrobotMimicEnv(LeggedRobot):
         self.demo_lengths = torch.full((1,), self.demo_length, device=self.device, dtype=torch.long)
         print("[mrobot_mimic] BPM reference network loaded")
         print(f"[mrobot_mimic] reference model: {self.reference_model_path}")
+        print(
+            "[mrobot_mimic] Observation layout changed: actor obs 64 -> 76. "
+            "Old checkpoints and normalizer statistics are incompatible. "
+            "Train from scratch or reset normalizer.",
+            flush=True,
+        )
 
         self.last_root_quat = torch.zeros((self.num_envs, 4), device=self.device)
 
-        self.all_tracking_indices = torch.cat((
-                self.base_indices,
-                self.feet_indices,
-                self.knee_indices,
-                self.hip_indices,
-                self.pelvic_yaw_indices,
-                self.waist_indices,
-            ), dim=0).long()
+        self.all_tracking_indices = self._resolve_tracking_body_indices(
+            getattr(self.cfg.asset, "tracking_body_names", None)
+        )
+        self._init_tracking_reference_specs()
         
         self.is_static_stand = torch.zeros(
             self.num_envs, 1, device=self.device, dtype=torch.float)
@@ -518,6 +520,99 @@ class MrobotMimicEnv(LeggedRobot):
         quat[..., 3] = 1.0
         return quat
 
+    def _body_names_from_indices(self, indices):
+        body_names = list(getattr(self, "body_names", []) or [])
+        result = []
+        for idx in indices.detach().cpu().tolist():
+            idx = int(idx)
+            result.append(body_names[idx] if 0 <= idx < len(body_names) else f"<body:{idx}>")
+        return result
+
+    def _resolve_tracking_body_indices(self, tracking_body_names=None):
+        if not tracking_body_names:
+            return torch.cat(
+                (
+                    self.base_indices,
+                    self.feet_indices,
+                    self.knee_indices,
+                    self.hip_indices,
+                    self.pelvic_yaw_indices,
+                    self.waist_indices,
+                ),
+                dim=0,
+            ).long()
+        body_names = list(getattr(self, "body_names", []) or [])
+        resolved = []
+        for name in tracking_body_names:
+            matches = [idx for idx, body_name in enumerate(body_names) if name in body_name]
+            if not matches:
+                raise ValueError(f"tracking_body_names entry '{name}' not found in asset bodies: {body_names}")
+            if len(matches) > 1:
+                matched_names = [body_names[idx] for idx in matches]
+                raise ValueError(f"tracking_body_names entry '{name}' matched multiple bodies: {matched_names}")
+            resolved.append(matches[0])
+        indices = torch.tensor(resolved, dtype=torch.long, device=self.device)
+        if len(torch.unique(indices)) != len(indices):
+            raise ValueError(f"tracking_body_names resolved duplicate indices: {tracking_body_names}")
+        return indices
+
+    def _make_tracking_ref_specs(self, indices):
+        source_groups = [
+            ("pelvis", self.base_indices),
+            ("feet", self.feet_indices),
+            ("knee", self.knee_indices),
+            ("hip", self.hip_indices),
+            ("pelvic_yaw", self.pelvic_yaw_indices),
+            ("waist", self.waist_indices),
+        ]
+        specs = []
+        for body_id in indices.detach().cpu().tolist():
+            body_id = int(body_id)
+            found = None
+            for kind, group_indices in source_groups:
+                group = [int(idx) for idx in group_indices.detach().cpu().tolist()]
+                if body_id in group:
+                    found = (kind, group.index(body_id))
+                    break
+            if found is None:
+                body_name = self._body_names_from_indices(torch.tensor([body_id], device=self.device))[0]
+                raise ValueError(f"tracking body '{body_name}' is not mapped to a reference tensor.")
+            specs.append(found)
+        return specs
+
+    def _init_tracking_reference_specs(self):
+        self._tracking_ref_specs = self._make_tracking_ref_specs(self.all_tracking_indices)
+
+    def _ref_tensors_for_kind(self, kind):
+        if kind == "pelvis":
+            return self.ref_pelvis_pos, self.ref_pelvis_quat, self.ref_pelvis_vel, self.ref_pelvis_ang_vel
+        if kind == "feet":
+            return self.ref_feet_pos, self.ref_feet_quat, self.ref_feet_vel, self.ref_feet_ang_vel
+        if kind == "knee":
+            return self.ref_knee_pos, self.ref_knee_quat, self.ref_knee_vel, self.ref_knee_ang_vel
+        if kind == "hip":
+            return self.ref_hip_pos, self.ref_hip_quat, self.ref_hip_vel, self.ref_hip_ang_vel
+        if kind == "pelvic_yaw":
+            return self.ref_pelvic_yaw_pos, self.ref_pelvic_yaw_quat, self.ref_pelvic_yaw_vel, self.ref_pelvic_yaw_ang_vel
+        if kind == "waist":
+            return self.ref_waist_pos, self.ref_waist_quat, self.ref_waist_vel, self.ref_waist_ang_vel
+        raise KeyError(kind)
+
+    def _tracking_ref_tensors(self):
+        pos, quat, lin_vel, ang_vel = [], [], [], []
+        for kind, part_idx in self._tracking_ref_specs:
+            src_pos, src_quat, src_lin_vel, src_ang_vel = self._ref_tensors_for_kind(kind)
+            pos.append(src_pos[:, part_idx : part_idx + 1])
+            quat.append(src_quat[:, part_idx : part_idx + 1])
+            lin_vel.append(src_lin_vel[:, part_idx : part_idx + 1])
+            ang_vel.append(src_ang_vel[:, part_idx : part_idx + 1])
+        return (
+            torch.cat(pos, dim=1),
+            torch.cat(quat, dim=1),
+            torch.cat(lin_vel, dim=1),
+            torch.cat(ang_vel, dim=1),
+        )
+
     def _predict_reference_state(self):
         encoded = encode_bpm_phase(
             self.bpm_cmd,
@@ -732,14 +827,17 @@ class MrobotMimicEnv(LeggedRobot):
         self.h_p0, self.h_q0 = self.get_ref_rel_state_current(self.ref_hip_pos, self.ref_hip_quat)
         self.pelvic_yaw_p0, self.pelvic_yaw_q0 = self.get_ref_rel_state_current(self.ref_pelvic_yaw_pos, self.ref_pelvic_yaw_quat)
         self.waist_p0, self.waist_q0 = self.get_ref_rel_state_current(self.ref_waist_pos, self.ref_waist_quat)
+        tracking_ref_pos, tracking_ref_quat, _, _ = self._tracking_ref_tensors()
+        tracking_p_b, tracking_q_b = self.get_rel_pose(self.all_tracking_indices, anchor_pos_w, anchor_quat_w)
+        tracking_p0, tracking_q0 = self.get_ref_rel_state_current(tracking_ref_pos, tracking_ref_quat)
         
         # A. 当前帧 (t)
-        # actor 的关节位置观测改为 q - ref_dof_pos_curr；
-        # goal 直接使用参考关节角，不再减 default_dof_pos。
+        # Actor q uses current controlled joint positions.  The reference joint
+        # position and velocity are provided in goal_buf.
         default_dof_pos_with_offset = self.default_dof_pos + self.default_dof_pos_offsets
         ref_dof_pos_abs_curr = self.ref_dof_pos
         ref_dof_pos_curr = ref_dof_pos_abs_curr[:, self.num_control] * self.obs_scales.dof_pos
-        ref_dof_vel_curr = self.ref_dof_vel * self.obs_scales.dof_vel
+        ref_dof_vel_curr = self.ref_dof_vel[:, self.num_control] * self.obs_scales.dof_vel
 
 
         # 计算位置误差 (在机器人局部坐标系下)
@@ -819,48 +917,79 @@ class MrobotMimicEnv(LeggedRobot):
         # 参考脚抬脚状态（1=抬脚，0=不抬脚），仅特权观测。feet_contact_buffer 存接触掩码(1=触地)，取反得抬脚
         ref_foot_contact_curr = 1.0 - self.ref_feet_contact
         
-        priv_obs_curr_part = torch.cat((
-            anchor_pos_b,   # 3
-            anchor_ori_b,   # 6
-            dif_root_linvel,  # 3：根线速度误差
-            dif_root_angvel,  # 3：根角速度误差
-            pelvis_err_p,   # 3：骨盆位置误差
-            pelvis_err_q,   # 6：骨盆姿态误差（6D）
-            feet_err_p,     # 6：双脚位置误差
-            feet_err_q,     # 12：双脚姿态误差（6D×2）
-            knee_err_p,     # 6：双膝位置误差
-            knee_err_q,     # 12：双膝姿态误差（6D×2）
-            hip_err_p,      # 6：双髋位置误差
-            hip_err_q,      # 12：双髋姿态误差（6D×2）
-            pelvic_yaw_err_p,  # 6：双侧 pelvic_yaw 位置误差
-            pelvic_yaw_err_q,  # 12：双侧 pelvic_yaw 姿态误差（6D×2）
-            waist_err_p,    # 3：腰位置误差
-            waist_err_q,    # 6：腰姿态误差（6D）
-            self.rand_push_force[:, :2] / self.cfg.domain_rand.max_push_vel_xy,  # 2
-            self.rand_push_torque / self.cfg.domain_rand.max_push_ang_vel,  # 3
-            self.disturbance_force[:, 0, :] / self.cfg.domain_rand.disturbance_range[1],  # 3
-            (self.friction_coeffs - self.cfg.domain_rand.friction_range[0]) / (self.cfg.domain_rand.friction_range[1] - self.cfg.domain_rand.friction_range[0]), # 1
-            (self.restitution_coeffs - self.cfg.domain_rand.restitution_range[0]) / (self.cfg.domain_rand.restitution_range[1] - self.cfg.domain_rand.restitution_range[0]), # 1
-            (self.Kp_factors[:, self.num_control] - self.cfg.domain_rand.kp_range[0]) / (self.cfg.domain_rand.kp_range[1] - self.cfg.domain_rand.kp_range[0]),  # 12
-            (self.Kd_factors[:, self.num_control] - self.cfg.domain_rand.kd_range[0]) / (self.cfg.domain_rand.kd_range[1] - self.cfg.domain_rand.kd_range[0]), # 12
-            (self.payload - self.cfg.domain_rand.payload_mass_range[0]) / (self.cfg.domain_rand.payload_mass_range[1] - self.cfg.domain_rand.payload_mass_range[0]), # 1
-            self.com_displacement * self.obs_scales.com_pos, # 3
-            ref_foot_contact_curr,  # 2：左/右脚参考抬脚（1=抬脚，0=不抬脚）
-            self._get_privileged_reference_phase_obs(norm_phase), # 1
-        ), dim=-1)  # 146
+        priv_curr_dim = int(
+            getattr(self.cfg.env, "num_privileged_obs", 45 + 146 + 31)
+            - getattr(self.cfg.env, "single_num_privileged_obs", 45)
+            - getattr(self.cfg.env, "num_goal_obs", 31)
+        )
+        if priv_curr_dim == 119:
+            num_tracking_parts = len(self.all_tracking_indices)
+            tracking_err_p = tracking_p_b - tracking_p0
+            tracking_err_q = self._quat_err_6d(tracking_q_b, tracking_q0, num_tracking_parts)
+            priv_obs_curr_part = torch.cat((
+                anchor_pos_b,   # 3
+                anchor_ori_b,   # 6
+                dif_root_linvel,  # 3
+                dif_root_angvel,  # 3
+                tracking_err_p,   # 7*3
+                tracking_err_q,   # 7*6
+                self.rand_push_force[:, :2] / self.cfg.domain_rand.max_push_vel_xy,  # 2
+                self.rand_push_torque / self.cfg.domain_rand.max_push_ang_vel,  # 3
+                self.disturbance_force[:, 0, :] / self.cfg.domain_rand.disturbance_range[1],  # 3
+                (self.friction_coeffs - self.cfg.domain_rand.friction_range[0]) / (self.cfg.domain_rand.friction_range[1] - self.cfg.domain_rand.friction_range[0]), # 1
+                (self.restitution_coeffs - self.cfg.domain_rand.restitution_range[0]) / (self.cfg.domain_rand.restitution_range[1] - self.cfg.domain_rand.restitution_range[0]), # 1
+                (self.Kp_factors[:, self.num_control] - self.cfg.domain_rand.kp_range[0]) / (self.cfg.domain_rand.kp_range[1] - self.cfg.domain_rand.kp_range[0]),  # 12
+                (self.Kd_factors[:, self.num_control] - self.cfg.domain_rand.kd_range[0]) / (self.cfg.domain_rand.kd_range[1] - self.cfg.domain_rand.kd_range[0]), # 12
+                (self.payload - self.cfg.domain_rand.payload_mass_range[0]) / (self.cfg.domain_rand.payload_mass_range[1] - self.cfg.domain_rand.payload_mass_range[0]), # 1
+                self.com_displacement * self.obs_scales.com_pos, # 3
+                ref_foot_contact_curr,  # 2：左/右脚参考抬脚（1=抬脚，0=不抬脚）
+                self._get_privileged_reference_phase_obs(norm_phase), # 1
+            ), dim=-1)
+        else:
+            priv_obs_curr_part = torch.cat((
+                anchor_pos_b,   # 3
+                anchor_ori_b,   # 6
+                dif_root_linvel,  # 3：根线速度误差
+                dif_root_angvel,  # 3：根角速度误差
+                pelvis_err_p,   # 3：骨盆位置误差
+                pelvis_err_q,   # 6：骨盆姿态误差（6D）
+                feet_err_p,     # 6：双脚位置误差
+                feet_err_q,     # 12：双脚姿态误差（6D×2）
+                knee_err_p,     # 6：双膝位置误差
+                knee_err_q,     # 12：双膝姿态误差（6D×2）
+                hip_err_p,      # 6：双髋位置误差
+                hip_err_q,      # 12：双髋姿态误差（6D×2）
+                pelvic_yaw_err_p,  # 6：双侧 pelvic_yaw 位置误差
+                pelvic_yaw_err_q,  # 12：双侧 pelvic_yaw 姿态误差（6D×2）
+                waist_err_p,    # 3：腰位置误差
+                waist_err_q,    # 6：腰姿态误差（6D）
+                self.rand_push_force[:, :2] / self.cfg.domain_rand.max_push_vel_xy,  # 2
+                self.rand_push_torque / self.cfg.domain_rand.max_push_ang_vel,  # 3
+                self.disturbance_force[:, 0, :] / self.cfg.domain_rand.disturbance_range[1],  # 3
+                (self.friction_coeffs - self.cfg.domain_rand.friction_range[0]) / (self.cfg.domain_rand.friction_range[1] - self.cfg.domain_rand.friction_range[0]), # 1
+                (self.restitution_coeffs - self.cfg.domain_rand.restitution_range[0]) / (self.cfg.domain_rand.restitution_range[1] - self.cfg.domain_rand.restitution_range[0]), # 1
+                (self.Kp_factors[:, self.num_control] - self.cfg.domain_rand.kp_range[0]) / (self.cfg.domain_rand.kp_range[1] - self.cfg.domain_rand.kp_range[0]),  # 12
+                (self.Kd_factors[:, self.num_control] - self.cfg.domain_rand.kd_range[0]) / (self.cfg.domain_rand.kd_range[1] - self.cfg.domain_rand.kd_range[0]), # 12
+                (self.payload - self.cfg.domain_rand.payload_mass_range[0]) / (self.cfg.domain_rand.payload_mass_range[1] - self.cfg.domain_rand.payload_mass_range[0]), # 1
+                self.com_displacement * self.obs_scales.com_pos, # 3
+                ref_foot_contact_curr,  # 2：左/右脚参考抬脚（1=抬脚，0=不抬脚）
+                self._get_privileged_reference_phase_obs(norm_phase), # 1
+            ), dim=-1)  # 146
+        if priv_obs_curr_part.shape[1] != priv_curr_dim:
+            raise RuntimeError(f"privileged current dim mismatch: got {priv_obs_curr_part.shape[1]}, cfg={priv_curr_dim}")
         
         if self.cfg.domain_rand.sys_delay:
             root_states_ = self.obs_imu_delay_buffer[torch.arange(self.num_envs), :, self.obs_imu_delay_timestep.long()]
             dof_pos_vel_ = self.obs_motor_delay_buffer[torch.arange(self.num_envs), :, self.obs_motor_delay_timestep.long()]
 
-            q = (dof_pos_vel_[:, :self.num_actions] - ref_dof_pos_abs_curr) * self.obs_scales.dof_pos
+            q = (dof_pos_vel_[:, :self.num_actions] - self.default_dof_pos) * self.obs_scales.dof_pos
             dq = dof_pos_vel_[:, self.num_actions:] * self.obs_scales.dof_vel
 
             base_ang_vel_ = quat_rotate_inverse(root_states_[:, 3:7], root_states_[:, 10:13])
             base_euler_xyz = get_euler_xyz_tensor(root_states_[:, 3:7])[:, 0:3]
 
         else:
-            q = (self.dof_pos - ref_dof_pos_abs_curr) * self.obs_scales.dof_pos
+            q = (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos
             dq = self.dof_vel * self.obs_scales.dof_vel
             base_ang_vel_ = self.base_ang_vel
             base_euler_xyz = self.base_euler_xyz[:, 0:3]
@@ -887,13 +1016,17 @@ class MrobotMimicEnv(LeggedRobot):
         ref_waist_euler = get_euler_xyz_tensor(ref_waist_quat)  # roll, pitch, yaw
         ref_waist_vel = self.ref_waist_vel[:, 0, :]
         ref_waist_ang_vel = self.ref_waist_ang_vel[:, 0, :]
-        goal_buf = torch.cat((
+        goal_terms = [
             ref_dof_pos_curr,                                          # 12：当前帧参考腿部关节位置（仅 num_control）
+            ref_dof_vel_curr,                                          # 12：当前帧参考腿部关节速度（仅 num_control）
             ref_waist_pos[:, 2:3],                                     # 1：参考 waist 高度 z
             ref_waist_euler[:, 0:2],                                   # 2：参考 waist roll+pitch
             ref_waist_vel * self.obs_scales.lin_vel,                   # 3：参考 waist 线速度
             ref_waist_ang_vel[:, 2:3] * self.obs_scales.ang_vel,       # 1：参考 waist 角速度 z 轴
-        ), dim=-1)  # 19
+        ]
+        if int(getattr(self.cfg.env, "num_goal_obs", 31)) >= 33:
+            goal_terms.append(self.ref_feet_contact.float())           # 2：参考脚底接触，1=触地，0=离地
+        goal_buf = torch.cat(goal_terms, dim=-1)
         
         
         '''
@@ -941,9 +1074,24 @@ class MrobotMimicEnv(LeggedRobot):
         # ), dim=-1)
         self.privileged_obs_buf = torch.cat((
             priv_obs_hist_part,  # 45
-            priv_obs_curr_part,  # 146
-            goal_buf,            # 19
+            priv_obs_curr_part,
+            goal_buf,
         ), dim=-1)
+        if not getattr(self, "_printed_observation_layout_shapes", False):
+            print(
+                "[mrobot_mimic][IsaacGym] Observation layout changed: Dance actor obs 61/73 -> 75 "
+                "or BPM actor obs 64 -> 76. "
+                "Old checkpoints and normalizer statistics are incompatible. "
+                "Train from scratch or reset normalizer.",
+                flush=True,
+            )
+            print(
+                "[mrobot_mimic][IsaacGym] observation shapes: "
+                f"obs_now.shape={tuple(obs_now.shape)}, goal_buf.shape={tuple(goal_buf.shape)}, "
+                f"actor obs.shape={tuple(self.obs_buf.shape)}, privileged obs.shape={tuple(self.privileged_obs_buf.shape)}",
+                flush=True,
+            )
+            self._printed_observation_layout_shapes = True
         if self.obs_buf.shape[1] != self.cfg.env.num_observations:
             raise RuntimeError(
                 f"obs dim mismatch: got {self.obs_buf.shape[1]}, cfg={self.cfg.env.num_observations}"
@@ -2138,14 +2286,7 @@ class MrobotMimicEnv(LeggedRobot):
         return r
     
     def _reward_imition_keybody_pos(self):
-        ref_body_pos = torch.cat((
-            self.ref_pelvis_pos,
-            self.ref_feet_pos,
-            self.ref_knee_pos,
-            self.ref_hip_pos,
-            self.ref_pelvic_yaw_pos,
-            self.ref_waist_pos,
-        ), dim=1)
+        ref_body_pos, _, _, _ = self._tracking_ref_tensors()
         cur_body_pos, target_pos = self._get_aligned_body_pos_targets(self.all_tracking_indices, ref_body_pos)
         self.key_body_diff = cur_body_pos - target_pos
         dist_sq = torch.sum(torch.square(self.key_body_diff), dim=(1, 2))
@@ -2270,14 +2411,7 @@ class MrobotMimicEnv(LeggedRobot):
 
     def _reward_imition_keybody_lin_vel(self):
         """关键点线速度跟踪奖励"""
-        ref_key_vel = torch.cat([
-            self.ref_pelvis_vel,
-            self.ref_feet_vel,
-            self.ref_knee_vel,
-            self.ref_hip_vel,
-            self.ref_pelvic_yaw_vel,
-            self.ref_waist_vel,
-        ], dim=1)
+        _, _, ref_key_vel, _ = self._tracking_ref_tensors()
         cur_key_vel, target_key_vel = self._get_aligned_body_vector_targets(self.all_tracking_indices, ref_key_vel, slice(7, 10))
         lin_vel_error = torch.sum(torch.square(cur_key_vel - target_key_vel), dim=-1).mean(dim=-1)
 
@@ -2286,14 +2420,7 @@ class MrobotMimicEnv(LeggedRobot):
     
     def _reward_imition_keybody_ang_vel(self):
         """关键点角速度跟踪奖励 """
-        ref_key_ang_vel = torch.cat([
-            self.ref_pelvis_ang_vel,
-            self.ref_feet_ang_vel,
-            self.ref_knee_ang_vel,
-            self.ref_hip_ang_vel,
-            self.ref_pelvic_yaw_ang_vel,
-            self.ref_waist_ang_vel,
-        ], dim=1)
+        _, _, _, ref_key_ang_vel = self._tracking_ref_tensors()
         cur_key_ang_vel, target_key_ang_vel = self._get_aligned_body_vector_targets(self.all_tracking_indices, ref_key_ang_vel, slice(10, 13))
         ang_vel_error = torch.sum(torch.square(cur_key_ang_vel - target_key_ang_vel), dim=-1).mean(dim=-1)
         sigma_ang_vel = 0.5 
@@ -2351,14 +2478,7 @@ class MrobotMimicEnv(LeggedRobot):
     
     def _reward_imitation_whole_body_pos(self):
         # A. 准备参考数据 (Reference Data) - 必须和索引顺序一致！
-        ref_body_pos = torch.cat((
-            self.ref_pelvis_pos,
-            self.ref_feet_pos,
-            self.ref_knee_pos,
-            self.ref_hip_pos,
-            self.ref_pelvic_yaw_pos,
-            self.ref_waist_pos,
-        ), dim=1)
+        ref_body_pos, _, _, _ = self._tracking_ref_tensors()
         cur_body_pos, target_pos = self._get_aligned_body_pos_targets(self.all_tracking_indices, ref_body_pos)
         dist_sq = torch.sum(torch.square(cur_body_pos - target_pos), dim=-1)
         mean_dist_sq = dist_sq.mean(dim=1)
@@ -2366,41 +2486,20 @@ class MrobotMimicEnv(LeggedRobot):
     
     def _reward_imitation_whole_body_rot(self):
         # A. 准备参考数据 (Reference Data)
-        ref_body_quat = torch.cat((
-            self.ref_pelvis_quat,
-            self.ref_feet_quat,
-            self.ref_knee_quat,
-            self.ref_hip_quat,
-            self.ref_pelvic_yaw_quat,
-            self.ref_waist_quat,
-        ), dim=1)
+        _, ref_body_quat, _, _ = self._tracking_ref_tensors()
         cur_body_quat, target_quat = self._get_aligned_body_quat_targets(self.all_tracking_indices, ref_body_quat)
         rot_error_rad = torch_utils.quat_error_magnitude(cur_body_quat, target_quat)
         return torch.exp(-torch.square(rot_error_rad).mean(dim=-1) / self.cfg.rewards.sigma.whole_body_rot**2)
     
     def _reward_imitation_whole_body_lin_vel(self):
         """全身（含Base）线速度跟踪奖励 - 带Yaw重定向"""
-        ref_body_vel = torch.cat((
-            self.ref_pelvis_vel,
-            self.ref_feet_vel,
-            self.ref_knee_vel,
-            self.ref_hip_vel,
-            self.ref_pelvic_yaw_vel,
-            self.ref_waist_vel,
-        ), dim=1)
+        _, _, ref_body_vel, _ = self._tracking_ref_tensors()
         cur_body_vel, target_vel = self._get_aligned_body_vector_targets(self.all_tracking_indices, ref_body_vel, slice(7, 10))
         lin_vel_error = torch.sum(torch.square(cur_body_vel - target_vel), dim=-1).mean(dim=-1)
         return torch.exp(-lin_vel_error / self.cfg.rewards.sigma.whole_body_lin_vel**2)
     
     def _reward_imitation_whole_body_ang_vel(self):
-        ref_body_ang_vel = torch.cat((
-            self.ref_pelvis_ang_vel,
-            self.ref_feet_ang_vel,
-            self.ref_knee_ang_vel,
-            self.ref_hip_ang_vel,
-            self.ref_pelvic_yaw_ang_vel,
-            self.ref_waist_ang_vel,
-        ), dim=1)
+        _, _, _, ref_body_ang_vel = self._tracking_ref_tensors()
         cur_body_ang_vel, target_ang_vel = self._get_aligned_body_vector_targets(self.all_tracking_indices, ref_body_ang_vel, slice(10, 13))
         ang_vel_error = torch.sum(torch.square(cur_body_ang_vel - target_ang_vel), dim=-1).mean(dim=-1)
         return torch.exp(-ang_vel_error / self.cfg.rewards.sigma.whole_body_ang_vel**2)

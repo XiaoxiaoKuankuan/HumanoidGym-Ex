@@ -133,24 +133,24 @@ import numpy as np
 
 # 从 checkpoint 导出时用的配置（与 humanoid/envs/custom/mrobot_mimic_config.py 保持一致，避免 import humanoid.envs 触发 isaacgym）
 MROBOT_MUSIC_CONFIG = {
-    "num_observations": 45 + 19,
-    "num_privileged_obs": 45 + 146 + 19,
+    "num_observations": 45 + 31,
+    "num_privileged_obs": 45 + 146 + 31,
     "num_control": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
     "num_aux": 9,  # 65  9
     "num_single_obs": 45,
-    "num_goal_obs": 19,
+    "num_goal_obs": 31,
     "actor_hidden_dims": [512, 256, 128],
      "critic_hidden_dims": [512, 256, 128],
     # "critic_hidden_dims": [768, 256, 128],
 }
 
 MROBOT_DANCE_CONFIG = {
-    "num_observations": 42 + 19,
-    "num_privileged_obs": 45 + 146 + 19,
+    "num_observations": 42 + 33,
+    "num_privileged_obs": 45 + 119 + 33,
     "num_control": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
     "num_aux": 9,
     "num_single_obs": 42,
-    "num_goal_obs": 19,
+    "num_goal_obs": 33,
     "actor_hidden_dims": [512, 256, 128],
     "critic_hidden_dims": [512, 256, 128],
 }
@@ -160,8 +160,89 @@ TASK_CONFIGS = {
     "mrobot_dance": MROBOT_DANCE_CONFIG,
 }
 
+TASK_LAYOUT_NOTES = {
+    "mrobot_music": (
+        "BPM actor obs = 76 = 45 proprio(q/dq/action/base/euler/phase/BPM) "
+        "+ 31 goal(ref_dof_pos/ref_dof_vel/waist)"
+    ),
+    "mrobot_dance": (
+        "Dance actor obs = 75 = 42 proprio(q/default_q/dq/action/base/euler) "
+        "+ 33 goal(ref_dof_pos/ref_dof_vel/waist/ref_feet_contact)"
+    ),
+}
+
+OLD_LAYOUT_NOTES = {
+    "mrobot_music": "旧 BPM checkpoint 通常是 actor obs 64、critic obs 210。",
+    "mrobot_dance": "旧 Dance checkpoint 通常是 actor obs 61 或 73、critic obs 210 或 222；当前为 actor obs 75、critic obs 197。",
+}
+
 # 观测维度
 NUM_OBS = MROBOT_MUSIC_CONFIG["num_observations"]
+
+
+def print_task_layout(task, cfg):
+    print(f"[export_actor] task={task}")
+    print(f"[export_actor] {TASK_LAYOUT_NOTES[task]}")
+    print(
+        "[export_actor] dims: "
+        f"num_single_obs={cfg['num_single_obs']}, "
+        f"num_goal_obs={cfg['num_goal_obs']}, "
+        f"num_observations={cfg['num_observations']}, "
+        f"num_privileged_obs={cfg['num_privileged_obs']}, "
+        f"num_actions={len(cfg['num_control'])}"
+    )
+    print(
+        "[export_actor] Observation layout changed. "
+        "Old checkpoints and normalizer statistics are incompatible; "
+        "train from scratch or reset normalizer before exporting."
+    )
+
+
+def _last_dim(tensor):
+    if not hasattr(tensor, "shape") or len(tensor.shape) == 0:
+        return None
+    return int(tensor.shape[-1])
+
+
+def _find_state_tensor(state_dict, suffix):
+    for key, value in state_dict.items():
+        if key == suffix or key.endswith("." + suffix):
+            return key, value
+    return None, None
+
+
+def validate_checkpoint_layout(model_state_dict, task, expected_actor_obs, expected_critic_obs):
+    actor_key, actor_weight = _find_state_tensor(model_state_dict, "actor.0.weight")
+    critic_key, critic_weight = _find_state_tensor(model_state_dict, "critic.0.weight")
+
+    if actor_weight is not None and int(actor_weight.shape[1]) != expected_actor_obs:
+        raise RuntimeError(
+            f"checkpoint actor 输入维度不匹配: {actor_key}.shape={tuple(actor_weight.shape)}, "
+            f"expected actor obs={expected_actor_obs}. {OLD_LAYOUT_NOTES[task]} "
+            "请使用新观测布局重新训练后的 checkpoint。"
+        )
+
+    if critic_weight is not None and int(critic_weight.shape[1]) != expected_critic_obs:
+        raise RuntimeError(
+            f"checkpoint critic 输入维度不匹配: {critic_key}.shape={tuple(critic_weight.shape)}, "
+            f"expected critic obs={expected_critic_obs}. {OLD_LAYOUT_NOTES[task]} "
+            "请使用新观测布局重新训练后的 checkpoint。"
+        )
+
+
+def validate_normalizer_state(normalizer_state_dict, expected_obs, source):
+    mean = normalizer_state_dict.get("_mean")
+    std = normalizer_state_dict.get("_std")
+    if mean is None or std is None:
+        raise RuntimeError(f"{source} 中的 obs_normalizer 缺少 _mean 或 _std。")
+    mean_dim = _last_dim(mean)
+    std_dim = _last_dim(std)
+    if mean_dim != expected_obs or std_dim != expected_obs:
+        raise RuntimeError(
+            f"{source} obs_normalizer 维度不匹配: _mean last_dim={mean_dim}, "
+            f"_std last_dim={std_dim}, expected={expected_obs}. "
+            "旧 normalizer 不能用于新观测布局，请重新训练或重置 normalizer。"
+        )
 
 
 # ==========================================
@@ -178,6 +259,7 @@ class NormalizerModule(nn.Module):
 
     def load_from_empirical_state_dict(self, state_dict):
         """从 runner 保存的 obs_normalizer.state_dict() 加载 _mean, _std。"""
+        validate_normalizer_state(state_dict, self._mean.shape[-1], "checkpoint")
         self._mean.copy_(state_dict["_mean"])
         self._std.copy_(state_dict["_std"])
 
@@ -236,6 +318,12 @@ def export_onnx_from_ckpt(ckpt_path, output_path, task="mrobot_music"):
     num_privileged_obs = cfg["num_privileged_obs"]
     num_actions = len(cfg["num_control"])
     num_aux = cfg["num_aux"]
+    print_task_layout(task, cfg)
+    try:
+        validate_checkpoint_layout(ckpt["model_state_dict"], task, num_obs, num_privileged_obs)
+    except RuntimeError as exc:
+        print(f"错误: {exc}")
+        return
     # 只加载 actor_critic.py，不经过 humanoid.algo.ppo.__init__（避免牵出 isaacgym）
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _actor_critic_path = os.path.join(_root, "algo", "ppo", "actor_critic.py")
@@ -253,7 +341,11 @@ def export_onnx_from_ckpt(ckpt_path, output_path, task="mrobot_music"):
         critic_hidden_dims=cfg["critic_hidden_dims"],
         init_noise_std=np.ones(num_actions, dtype=np.float32),
     ).cpu()
-    actor_critic.load_state_dict(ckpt["model_state_dict"], strict=False)
+    try:
+        actor_critic.load_state_dict(ckpt["model_state_dict"], strict=False)
+    except RuntimeError as exc:
+        print(f"错误: checkpoint 与当前 {task} 网络结构不匹配，无法导出。\n详情: {exc}")
+        return
     actor_critic.eval()
 
     deploy_model = ReAssembledPolicy.from_actor_critic(actor_critic)
@@ -262,7 +354,11 @@ def export_onnx_from_ckpt(ckpt_path, output_path, task="mrobot_music"):
     if "obs_normalizer" in ckpt:
         print("从 checkpoint 加载观测归一化，ONNX 将包含归一化 (输入为 raw obs)")
         normalizer = NormalizerModule(shape=num_obs)
-        normalizer.load_from_empirical_state_dict(ckpt["obs_normalizer"])
+        try:
+            normalizer.load_from_empirical_state_dict(ckpt["obs_normalizer"])
+        except RuntimeError as exc:
+            print(f"错误: {exc}")
+            return
         deploy_model = PolicyWithNormalizer(normalizer, deploy_model)
         deploy_model.eval()
     else:
@@ -299,6 +395,9 @@ def export_onnx(jit_path, output_path, ckpt_path=None, task="mrobot_music"):
     output_path: 输出的 ONNX 路径
     ckpt_path: 可选，训练 checkpoint (.pt)，若含有 obs_normalizer 则把归一化 baked 进 ONNX
     """
+    cfg = TASK_CONFIGS[task]
+    num_obs = cfg["num_observations"]
+    print_task_layout(task, cfg)
     print(f"正在加载 JIT 模型: {jit_path}")
     if not os.path.exists(jit_path):
         print("错误: 找不到 JIT 模型文件")
@@ -315,10 +414,25 @@ def export_onnx(jit_path, output_path, ckpt_path=None, task="mrobot_music"):
     # 若提供 checkpoint 且含 normalizer，则包一层归一化再导出
     if ckpt_path and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        if "model_state_dict" in ckpt:
+            try:
+                validate_checkpoint_layout(
+                    ckpt["model_state_dict"],
+                    task,
+                    num_obs,
+                    cfg["num_privileged_obs"],
+                )
+            except RuntimeError as exc:
+                print(f"错误: {exc}")
+                return
         if "obs_normalizer" in ckpt:
             print(f"从 checkpoint 加载观测归一化参数: {ckpt_path}")
-            normalizer = NormalizerModule(shape=TASK_CONFIGS[task]["num_observations"])
-            normalizer.load_from_empirical_state_dict(ckpt["obs_normalizer"])
+            normalizer = NormalizerModule(shape=num_obs)
+            try:
+                normalizer.load_from_empirical_state_dict(ckpt["obs_normalizer"])
+            except RuntimeError as exc:
+                print(f"错误: {exc}")
+                return
             deploy_model = PolicyWithNormalizer(normalizer, deploy_model)
             deploy_model.eval()
             print("ONNX 将包含归一化 (输入为 raw obs)")
@@ -328,7 +442,6 @@ def export_onnx(jit_path, output_path, ckpt_path=None, task="mrobot_music"):
         if ckpt_path:
             print(f"未找到 checkpoint 或未指定: {ckpt_path}，导出不含归一化")
 
-    num_obs = TASK_CONFIGS[task]["num_observations"]
     dummy_input = torch.randn(1, num_obs, device='cpu')
     print(f"开始导出 ONNX (task={task}, 输入维度: {num_obs})...")
 
@@ -365,7 +478,7 @@ if __name__ == "__main__":
                         default=os.path.join(os.path.dirname(__file__), "casbot_mimic.onnx"),
                         help="输出 ONNX 路径")
     parser.add_argument("--task", type=str, default="mrobot_music", choices=sorted(TASK_CONFIGS.keys()),
-                        help="导出任务配置。mrobot_music 输入 64 维；mrobot_dance 输入 61 维。")
+                        help="导出任务配置。mrobot_music 输入 76 维；mrobot_dance 输入 75 维。")
     args = parser.parse_args()
 
     if args.ckpt_path and not args.jit_path:
