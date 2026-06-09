@@ -6,10 +6,7 @@ from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_common_config_lab import (
     MrobotMimicCommonLabCfg,
     MrobotMimicCommonLabCfgPPO,
 )
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config import (
-    MrobotMimicDanceCfg,
-    MrobotMimicDanceCfgPPO,
-)
+from humanoid_gym_ex.utils.mrobot_trajectory_reference import DEFAULT_DANCE_MOTION_FILES
 from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_common_config import (
     ARMATURE_10020_12,
     ARMATURE_6408_25,
@@ -32,7 +29,7 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
     class sim(MrobotMimicCommonLabCfg.sim):
         dt = 0.005  # 200 Hz low-level physics
 
-    class env(MrobotMimicDanceCfg.env):
+    class env(MrobotMimicCommonLabCfg.env):
         frame_stack = 1
         c_frame_stack = 1
         num_single_obs = 42
@@ -49,9 +46,8 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
         ref_num_notcontrol = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
         normalize_obs = True
 
-    class motion(MrobotMimicDanceCfg.motion):
-        reference_source = "trajectory"
-        files = list(MrobotMimicDanceCfg.motion.files)
+    class motion:
+        files = list(DEFAULT_DANCE_MOTION_FILES)
         allow_legacy_keypoint_fallback = False
         reference_fps = 50
         zero_start_ratio = 0.1
@@ -62,22 +58,30 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
         adaptive_uniform_ratio = 0.1
         foot_contact_height_threshold = 0.08
 
-    class asset(MrobotMimicDanceCfg.asset):
+    class asset(MrobotMimicCommonLabCfg.asset):
         file = (
             "{LEGGED_GYM_ROOT_DIR}/resources/robots/CASBOT02_ENCOS_7dof_shell_20251015/"
             "Serial/urdf/CASBOT02_ENCOS_7dof_shell_20251015_guitar.urdf"
         )
         base_name = "base_link"
         waist_name = "waist_yaw_link"
-        foot_name = MrobotMimicDanceCfg.asset.foot_name
-        ankle_name = MrobotMimicDanceCfg.asset.ankle_name
-        knee_name = MrobotMimicDanceCfg.asset.knee_name
-        hip_name = MrobotMimicDanceCfg.asset.hip_name
-        pelvic_yaw_name = MrobotMimicDanceCfg.asset.pelvic_yaw_name
-        head_name = MrobotMimicDanceCfg.asset.head_name
-        tracking_body_names = list(MrobotMimicDanceCfg.asset.tracking_body_names)
-        terminate_after_contacts_on = list(MrobotMimicDanceCfg.asset.terminate_after_contacts_on)
-        penalize_contacts_on = list(MrobotMimicDanceCfg.asset.penalize_contacts_on)
+        foot_name = MrobotMimicCommonLabCfg.asset.foot_name
+        ankle_name = MrobotMimicCommonLabCfg.asset.ankle_name
+        knee_name = MrobotMimicCommonLabCfg.asset.knee_name
+        hip_name = MrobotMimicCommonLabCfg.asset.hip_name
+        pelvic_yaw_name = MrobotMimicCommonLabCfg.asset.pelvic_yaw_name
+        head_name = MrobotMimicCommonLabCfg.asset.head_name
+        tracking_body_names = [
+            "waist_yaw_link",
+            "left_leg_pelvic_roll_link",
+            "left_leg_knee_pitch_link",
+            "left_leg_ankle_roll_link",
+            "right_leg_pelvic_roll_link",
+            "right_leg_knee_pitch_link",
+            "right_leg_ankle_roll_link",
+        ]
+        terminate_after_contacts_on = list(MrobotMimicCommonLabCfg.asset.terminate_after_contacts_on)
+        penalize_contacts_on = list(MrobotMimicCommonLabCfg.asset.penalize_contacts_on)
         fix_base_link = False
         self_collisions = 0
 
@@ -188,7 +192,7 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
         decimation = 4  # 50 Hz policy/control with sim.dt=0.005
         match_reference_fps = True
 
-    class termination(MrobotMimicDanceCfg.termination):
+    class termination:
         use_tracking_error_termination = True
         waist_z_threshold = 0.25
         waist_ori_threshold = 0.8
@@ -306,7 +310,7 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
         # every episode; PhysX properties are rewritten on full-env reset.
         resample_physx_randomization_on_small_reset = False
 
-    class rewards(MrobotMimicDanceCfg.rewards):
+    class rewards(MrobotMimicCommonLabCfg.rewards):
         dof_err_w = [
             1.0,
             1.0,
@@ -322,7 +326,7 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
             1.0,
         ]
 
-        class sigma(MrobotMimicDanceCfg.rewards.sigma):
+        class sigma(MrobotMimicCommonLabCfg.rewards.sigma):
             foot_height = 0.08
             whole_body_pos = 0.15
             whole_body_rot = 0.4
@@ -357,18 +361,18 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
             torque_limits = -1.0
             termination = -100.0  
 
-    class noise(MrobotMimicDanceCfg.noise):
+    class noise(MrobotMimicCommonLabCfg.noise):
         add_noise = True
         noise_level = 1.0
 
-        class noise_scales(MrobotMimicDanceCfg.noise.noise_scales):
+        class noise_scales(MrobotMimicCommonLabCfg.noise.noise_scales):
             dof_pos = 0.01
             dof_vel = 0.5
             ang_vel = 0.3
             euler = 0.1
 
-    class normalization(MrobotMimicDanceCfg.normalization):
-        class obs_scales(MrobotMimicDanceCfg.normalization.obs_scales):
+    class normalization(MrobotMimicCommonLabCfg.normalization):
+        class obs_scales(MrobotMimicCommonLabCfg.normalization.obs_scales):
             lin_vel = 2.0
             ang_vel = 1.0
             dof_pos = 1.0
@@ -381,10 +385,10 @@ class MrobotMimicDanceLabCfg(MrobotMimicCommonLabCfg):
         actions_filter = False
 
 
-class MrobotMimicDanceLabCfgPPO(MrobotMimicDanceCfgPPO):
+class MrobotMimicDanceLabCfgPPO(MrobotMimicCommonLabCfgPPO):
     seed = 5
 
-    class policy(MrobotMimicDanceCfgPPO.policy):
+    class policy(MrobotMimicCommonLabCfgPPO.policy):
         init_noise_std = np.array([0.8, 0.8, 0.8, 0.8, 1.2, 1.2, 0.8, 0.8, 0.8, 0.8, 1.2, 1.2])
         num_single_obs = 42
         num_goal_obs = 33
@@ -402,7 +406,7 @@ class MrobotMimicDanceLabCfgPPO(MrobotMimicDanceCfgPPO):
         lam = 0.95
         num_mini_batches = 4
 
-    class runner(MrobotMimicDanceCfgPPO.runner):
+    class runner(MrobotMimicCommonLabCfgPPO.runner):
         policy_class_name = "ActorCritic"
         algorithm_class_name = "PPO"
         num_steps_per_env = 24

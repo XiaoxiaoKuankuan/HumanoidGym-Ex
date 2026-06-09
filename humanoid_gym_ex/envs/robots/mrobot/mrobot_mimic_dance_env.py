@@ -14,23 +14,11 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
 
     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
         self._apply_reference_fps_decimation(cfg, sim_params)
-        LeggedRobot.__init__(self, cfg, sim_params, physics_engine, sim_device, headless)
-        self.last_feet_z = 0.05
-        self.feet_height = torch.zeros((self.num_envs, 2), device=self.device)
-        self.num_aux = self.cfg.env.num_aux
-        self.rand_init_coef = self.cfg.env.rand_init_coef
-        self.num_disc_obs = self.cfg.env.num_disc_obs
-        dof_err_w = getattr(self.cfg.rewards, "dof_err_w", [1.0] * len(self.num_control))
-        if len(dof_err_w) != len(self.num_control):
-            raise ValueError(
-                f"cfg.rewards.dof_err_w length must be {len(self.num_control)}, got {len(dof_err_w)}"
-            )
-        self.dof_err_w = torch.tensor(dof_err_w, device=self.device, dtype=torch.float32)
+        super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
 
+    def _init_task_reference(self):
         self._load_trajectory_library()
         self._init_reference_state_buffers()
-        self.phase_rad = torch.zeros(self.num_envs, 1, device=self.device)
-        self.normalized_bpm_cmd = torch.zeros(self.num_envs, 1, device=self.device)
         print("[mrobot_dance] 指定轨迹 reference 加载完成")
         print(f"[mrobot_dance] 轨迹数量: {self.data_length}")
         print(f"[mrobot_dance] 各轨迹真实长度: {[int(x) for x in self.demo_lengths.detach().cpu().tolist()]}")
@@ -42,24 +30,7 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
             flush=True,
         )
 
-        self.last_root_quat = torch.zeros((self.num_envs, 4), device=self.device)
-        self.all_tracking_indices = self._resolve_tracking_body_indices(
-            getattr(self.cfg.asset, "tracking_body_names", None)
-        )
-        self._init_tracking_reference_specs()
-        print(
-            "[mrobot_dance][IsaacGym] tracking bodies: "
-            f"count={len(self.all_tracking_indices)}, "
-            f"names={self._body_names_from_indices(self.all_tracking_indices)}, "
-            f"indices={self.all_tracking_indices.detach().cpu().tolist()}",
-            flush=True,
-        )
-        self.is_static_stand = torch.zeros(self.num_envs, 1, device=self.device, dtype=torch.float)
-        self.base_height_idx = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.ref_idx = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.phase_idx = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.last_root_offset = torch.zeros(self.num_envs, 7, device=self.device, dtype=torch.float)
-        self.initial_base_yaw = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+    def _init_task_buffers(self):
         self.waist_body_id = int(self.waist_indices[0].item()) if len(self.waist_indices) else int(self.base_indices[0].item())
         self.contact_reset_buf = torch.zeros_like(self.fall_reset_buf)
         self.base_too_low_buf = torch.zeros_like(self.fall_reset_buf)
@@ -68,18 +39,16 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
         self.waist_ori_bad_buf = torch.zeros_like(self.fall_reset_buf)
         self.foot_z_bad_buf = torch.zeros_like(self.fall_reset_buf)
         self.adaptive_phase_failure_buf = torch.zeros_like(self.fall_reset_buf)
-
-        self._ankle_obs_joint_indices = torch.tensor(
-            getattr(self.cfg.domain_rand, "ankle_obs_joint_indices", [4, 5, 10, 11]),
-            device=self.device,
-            dtype=torch.long,
-        )
-        n_ankle_obs = len(self._ankle_obs_joint_indices)
-        self.ankle_obs_pos_bias = torch.zeros(self.num_envs, n_ankle_obs, device=self.device, dtype=torch.float)
-        self.ankle_obs_vel_bias = torch.zeros(self.num_envs, n_ankle_obs, device=self.device, dtype=torch.float)
-        self._init_ankle_dq_randomization_buffers(n_ankle_obs)
         self._init_adaptive_phase_sampling()
 
+    def _post_task_reference_init(self):
+        print(
+            "[mrobot_dance][IsaacGym] tracking bodies: "
+            f"count={len(self.all_tracking_indices)}, "
+            f"names={self._body_names_from_indices(self.all_tracking_indices)}, "
+            f"indices={self.all_tracking_indices.detach().cpu().tolist()}",
+            flush=True,
+        )
         reference_fps = float(getattr(self.cfg.motion, "reference_fps", 0.0))
         expected_ref_dt = 1.0 / reference_fps if reference_fps > 0.0 else 0.0
         print(
@@ -98,9 +67,6 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
             f"num_bins={[int(x) for x in self.motion_num_bins.detach().cpu().tolist()]}",
             flush=True,
         )
-
-        self.reset_idx(torch.arange(self.num_envs, device=self.device))
-        self.compute_observations()
 
     @staticmethod
     def _apply_reference_fps_decimation(cfg, sim_params):
@@ -216,6 +182,29 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
     def _advance_reference_phase(self):
         max_phase = self.demo_lengths[self.ref_idx].clamp(min=1) - 1
         self.phase_idx[:] = torch.minimum(self.phase_idx + 1, max_phase)
+
+    def _get_noncontrolled_ref_actions(self):
+        self.compute_ref_state()
+        ref_pos = self.ref_dof_pos[:, self.ref_num_notcontrol]
+        return ref_pos / self.cfg.control.action_scale
+
+    def _sample_reference_reset_state(self, env_ids):
+        if self.cfg.domain_rand.RSI:
+            self.ref_idx[env_ids] = torch.randint(0, self.data_length, (len(env_ids),), device=self.device)
+            self.episode_phase_buf[env_ids] = self._sample_mixed_phase_starts(self.ref_idx[env_ids])
+        else:
+            self.ref_idx[env_ids] = 0
+            self.episode_phase_buf[env_ids] = 0
+
+    def _get_reset_reference_dof_state(self, env_ids):
+        ref_ids = self.ref_idx[env_ids]
+        phase_ids = self.episode_phase_buf[env_ids]
+        return self.dof_pos_buffer[ref_ids, phase_ids], self.dof_vel_buffer[ref_ids, phase_ids]
+
+    def _apply_reference_root_reset(self, env_ids):
+        ref_ids = self.ref_idx[env_ids]
+        phase_ids = self.episode_phase_buf[env_ids]
+        self.root_states[env_ids, 0:2] += self.root_states_buffer[ref_ids, phase_ids][:, 0:2]
 
     def _init_adaptive_phase_sampling(self):
         motion = self.cfg.motion

@@ -150,47 +150,20 @@ class LeggedRobot(BaseTask):
         self.compute_observations()
         return self.obs_buf, self.privileged_obs_buf
 
-    def _uses_network_reference(self):
-        return hasattr(self, "bpm_cmd") and hasattr(self, "phase_rad") and hasattr(self, "ref_dof_pos")
-
     def _get_noncontrolled_ref_actions(self):
-        if self._uses_network_reference():
-            self.compute_ref_state()
-            ref_pos = self.ref_dof_pos[:, self.ref_num_notcontrol]
-        else:
-            ref_pos = self.dof_pos_buffer[self.ref_idx, self.phase_idx][:, self.ref_num_notcontrol]
-        return ref_pos / self.cfg.control.action_scale
+        raise NotImplementedError("Mimic task env must implement _get_noncontrolled_ref_actions().")
 
     def _advance_reference_phase(self):
-        current_demo_lengths = self._get_demo_lengths_for_ref_ids(self.ref_idx).clamp(min=1)
-        self.phase_idx[:] = torch.remainder(self.episode_phase_buf + 1, current_demo_lengths)
+        raise NotImplementedError("Mimic task env must implement _advance_reference_phase().")
 
     def _sample_reference_reset_state(self, env_ids):
-        if self.cfg.domain_rand.RSI:
-            self.ref_idx[env_ids] = torch.randint(0, self.data_length, (len(env_ids), ), device=self.device)
-            # mimic 训练支持混合 reset 采样：
-            # 70% 保持原始均匀分布，30% 从用户指定的 hard 片段附近采样。
-            self.episode_phase_buf[env_ids] = self._sample_mixed_phase_starts(self.ref_idx[env_ids])
-        else:
-            self.ref_idx[env_ids] = 0
-            self.episode_phase_buf[env_ids] = 0
+        raise NotImplementedError("Mimic task env must implement _sample_reference_reset_state().")
 
     def _get_reset_reference_dof_state(self, env_ids):
-        if self._uses_network_reference():
-            self.compute_ref_state()
-            return self.ref_dof_pos[env_ids], self.ref_dof_vel[env_ids]
-        ref_ids = self.ref_idx[env_ids]
-        phase_ids = self.episode_phase_buf[env_ids]
-        return self.dof_pos_buffer[ref_ids, phase_ids], self.dof_vel_buffer[ref_ids, phase_ids]
+        raise NotImplementedError("Mimic task env must implement _get_reset_reference_dof_state().")
 
     def _apply_reference_root_reset(self, env_ids):
-        if self._uses_network_reference():
-            if hasattr(self, "ref_waist_pos"):
-                self.root_states[env_ids, 0:2] += self.ref_waist_pos[env_ids, 0, 0:2]
-            return
-        ref_ids = self.ref_idx[env_ids]
-        phase_ids = self.episode_phase_buf[env_ids]
-        self.root_states[env_ids, 0:2] += self.root_states_buffer[ref_ids, phase_ids][:, 0:2]
+        raise NotImplementedError("Mimic task env must implement _apply_reference_root_reset().")
 
     def _get_demo_lengths_for_ref_ids(self, ref_ids):
         if hasattr(self, "demo_lengths"):
@@ -331,11 +304,8 @@ class LeggedRobot(BaseTask):
         termination_contact_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
         self.base_too_low_buf = self.root_states[:, 2] < 0.5
-        if self._uses_network_reference():
-            self.ref_end_reset_buf[:] = False
-        else:
-            current_demo_lengths = self._get_demo_lengths_for_ref_ids(self.ref_idx)
-            self.ref_end_reset_buf = self.phase_idx >= (current_demo_lengths - 1)
+        current_demo_lengths = self._get_demo_lengths_for_ref_ids(self.ref_idx)
+        self.ref_end_reset_buf = self.phase_idx >= (current_demo_lengths - 1)
         # root_height = self.root_states_buffer[self.ref_idx, self.phase_idx][:, 2]
 
         # self.body_error_buf = torch.abs(self.root_states[:, 2] - root_height) > 0.3

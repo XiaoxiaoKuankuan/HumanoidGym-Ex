@@ -73,8 +73,8 @@ from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR  # noqa: E402
 from humanoid_gym_ex.envs.robots.mrobot.isaaclab_env import (  # noqa: E402
     MrobotMimicDanceIsaacLabEnv,
     MrobotMimicDanceIsaacLabEnvCfg,
-    MrobotMimicIsaacLabEnv,
-    MrobotMimicIsaacLabEnvCfg,
+    MrobotMimicBPMIsaacLabEnv,
+    MrobotMimicBPMIsaacLabEnvCfg,
 )
 from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_bpm_config_lab import (  # noqa: E402
     MrobotMimicBPMLabCfg,
@@ -245,8 +245,8 @@ def _task_setup(task_name):
             MrobotMimicDanceLabCfgPPO,
         )
     return (
-        MrobotMimicIsaacLabEnvCfg(),
-        MrobotMimicIsaacLabEnv,
+        MrobotMimicBPMIsaacLabEnvCfg(),
+        MrobotMimicBPMIsaacLabEnv,
         MrobotMimicBPMLabCfg,
         MrobotMimicBPMLabCfgPPO,
     )

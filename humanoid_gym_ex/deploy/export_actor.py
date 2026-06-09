@@ -131,7 +131,7 @@ import argparse
 import importlib.util
 import numpy as np
 
-# 从 checkpoint 导出时用的配置（与 humanoid/envs/custom/mrobot_mimic_config.py 保持一致，避免 import humanoid.envs 触发 isaacgym）
+# 从 checkpoint 导出时用的轻量配置，避免 import humanoid.envs 触发 isaacgym。
 MROBOT_MUSIC_CONFIG = {
     "num_observations": 45 + 31,
     "num_privileged_obs": 45 + 146 + 31,

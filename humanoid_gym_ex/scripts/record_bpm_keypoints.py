@@ -288,11 +288,11 @@ def _repair_first_keypoint_frame_if_needed(buffers, jump_threshold=FIRST_FRAME_K
 
 def _configure_env(args):
     from humanoid_gym_ex.envs.robots.mrobot.isaaclab_env import (
-        MrobotMimicIsaacLabEnv,
-        MrobotMimicIsaacLabEnvCfg,
+        MrobotMimicBPMIsaacLabEnv,
+        MrobotMimicBPMIsaacLabEnvCfg,
     )
 
-    env_cfg = MrobotMimicIsaacLabEnvCfg()
+    env_cfg = MrobotMimicBPMIsaacLabEnvCfg()
     env_cfg.seed = 123145
     env_cfg.scene.num_envs = 1
     env_cfg.sim.device = args.device
@@ -302,7 +302,7 @@ def _configure_env(args):
     if args.reference_model is not None:
         env_cfg.reference_model_path = args.reference_model
 
-    env = MrobotMimicIsaacLabEnv(env_cfg)
+    env = MrobotMimicBPMIsaacLabEnv(env_cfg)
     env.reset()
     return env
 

@@ -47,7 +47,6 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config import MrobotMimicDanceCfg
 from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config_lab import MrobotMimicDanceLabCfg
 from humanoid_gym_ex.scripts.sim2sim_mimic import (
     compute_body_midpoint,
@@ -705,12 +704,12 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    class Sim2simDanceCfg(MrobotMimicDanceCfg):
-        class init_state(MrobotMimicDanceCfg.init_state):
+    class Sim2simDanceCfg(MrobotMimicDanceLabCfg):
+        class init_state(MrobotMimicDanceLabCfg.init_state):
             # Keep q-default_q observation identical to Lab dance training.
             default_joint_angles = dict(MrobotMimicDanceLabCfg.init_state.default_joint_angles)
 
-        class normalization(MrobotMimicDanceCfg.normalization):
+        class normalization(MrobotMimicDanceLabCfg.normalization):
             # Dance Lab training currently disables action interpolation/filtering.
             actions_filter = False
 

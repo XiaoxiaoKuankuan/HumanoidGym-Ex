@@ -22,7 +22,7 @@ from tqdm import tqdm
 from collections import deque
 from scipy.spatial.transform import Rotation as R
 from humanoid_gym_ex import LEGGED_GYM_ROOT_DIR
-from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_bpm_config import MrobotMimicCfg
+from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_bpm_config_lab import MrobotMimicBPMLabCfg
 from humanoid_gym_ex.scripts.space4bar import Space4Bar
 from humanoid_gym_ex.utils.reference_state import ReferenceStateNet
 import torch
@@ -1219,7 +1219,7 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
-    class Sim2simCfg(MrobotMimicCfg):
+    class Sim2simCfg(MrobotMimicBPMLabCfg):
         class sim_config:
             if args.terrain:
                 mujoco_model_path = f'{LEGGED_GYM_ROOT_DIR}/resources/robots/Mrobot/mjcf/mjmodel_terrain.xml'

@@ -63,8 +63,8 @@ from humanoid_gym_ex.algo.ppo.on_policy_runner import OnPolicyRunner  # noqa: E4
 from humanoid_gym_ex.envs.robots.mrobot.isaaclab_env import (  # noqa: E402
     MrobotMimicDanceIsaacLabEnv,
     MrobotMimicDanceIsaacLabEnvCfg,
-    MrobotMimicIsaacLabEnv,
-    MrobotMimicIsaacLabEnvCfg,
+    MrobotMimicBPMIsaacLabEnv,
+    MrobotMimicBPMIsaacLabEnvCfg,
 )
 from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config_lab import (  # noqa: E402
     MrobotMimicDanceLabCfg,
@@ -124,8 +124,8 @@ def main():
         cfg_class = MrobotMimicDanceLabCfg
     else:
         train_cfg = MrobotMimicBPMLabCfgPPO()
-        env_cfg = MrobotMimicIsaacLabEnvCfg()
-        env_class = MrobotMimicIsaacLabEnv
+        env_cfg = MrobotMimicBPMIsaacLabEnvCfg()
+        env_class = MrobotMimicBPMIsaacLabEnv
         cfg_class = MrobotMimicBPMLabCfg
     if args_cli.seed is not None:
         train_cfg.seed = args_cli.seed

@@ -101,13 +101,6 @@ class MrobotMimicCommonCfg(LeggedRobotCfg):
         frame_stack = 1
         c_frame_stack = 1
         d_frame_stack = 10
-        # Actor 只控制腿部 12 个关节，不再控制腰。
-        num_single_obs = 45
-        # ref_dof_pos(12)+ref_dof_vel(12)+waist_z(1)+waist_rp(2)+waist_vel(3)+waist_angvel_z(1)
-        num_goal_obs = 31
-        num_observations = num_single_obs + num_goal_obs
-        single_num_privileged_obs = 45  # height(1)+roll_pitch(2)+dof_pos(12)+dof_vel(12)+act(12)+linvel(3)+angvel(3)
-        num_privileged_obs = 45 + 146 + num_goal_obs  # 当前 priv_hist_part + priv_curr + 当前 goal
         single_num_disc_obs = 67
         num_disc_obs = int(d_frame_stack * single_num_disc_obs)
         num_actions = 29  # 28  29
@@ -122,13 +115,6 @@ class MrobotMimicCommonCfg(LeggedRobotCfg):
         ref_num_notcontrol = [12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28]
         rand_init_coef = 0.8
         normalize_obs = True  # 是否对观测做 running mean/std 归一化  False
-        
-    class motion:
-        reference_source = "common"
-        foot_contact_height_threshold = 0.08
-
-
-
     class safety:
         # safety factors
         pos_limit = 1
@@ -934,8 +920,6 @@ class MrobotMimicCommonCfgPPO(LeggedRobotCfgPPO):
         init_noise_std = np.array([0.8, 0.8, 0.8, 0.8, 1.2, 1.2, 
                                    0.8, 0.8, 0.8, 0.8, 1.2, 1.2])*1
         # init_noise_std = -1.
-        num_single_obs = 45
-        num_goal_obs = 31  # 与 env.num_goal_obs 保持一致
         actor_hidden_dims = [512, 256, 128]
         # critic_hidden_dims = [768, 256, 128]
         critic_hidden_dims = [512, 256, 128]
@@ -964,7 +948,7 @@ class MrobotMimicCommonCfgPPO(LeggedRobotCfgPPO):
 
         # logging
         save_interval =250  # Please check for potential savings every `save_interval` iterations.
-        experiment_name = 'mrobot_mimic_May_music_BPM'
+        experiment_name = 'mrobot_mimic'
         run_name = ''
         # Load and resume
         resume = False 
