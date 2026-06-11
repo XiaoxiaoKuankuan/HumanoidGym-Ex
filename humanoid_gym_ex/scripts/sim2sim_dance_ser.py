@@ -1,9 +1,9 @@
-"""MuJoCo sim2sim for the MRobot specified-trajectory dance task.
+"""Serial-ankle MuJoCo sim2sim for the MRobot specified-trajectory dance task.
 
-This is the trajectory-reference counterpart of ``sim2sim_mimic.py``.  It
-loads a dance ``*_keypoint.npz`` or ``*_keypoint.csv`` file, builds the new 75-dim policy input
-(``42`` proprio + ``33`` current goal), and drives the 29-DOF MuJoCo model with
-12 policy-controlled leg joints while the remaining joints follow reference.
+This script mirrors ``sim2sim_dance.py`` but loads the serial-ankle XML and
+directly reads/writes serial joint state/torques.  It intentionally removes the
+parallel ankle/four-bar mapping so it can be used as a performance/control
+counterpart for the parallel XML.
 """
 
 from __future__ import annotations
@@ -54,18 +54,9 @@ from humanoid_gym_ex.scripts.sim2sim_mimic import (
     get_body_world_pos,
     get_foot_forces,
     get_obs,
-    init_fourbar_params,
     load_policy,
-    parallel_to_serial_pos_np,
-    parallel_to_serial_vel_np,
-    parallel_xml_to_policy_pos_np,
-    parallel_xml_to_policy_vel_np,
     pd_control,
-    policy_parallel_to_xml_tau_np,
     SERIAL_DOF_JOINT_NAMES,
-    serial_tau_to_parallel_policy_tau_np,
-    serial_to_parallel_pos_np,
-    set_initial_joint_state,
     wrap_to_pi_np,
 )
 from humanoid_gym_ex.utils.mrobot_trajectory_reference import DEFAULT_DANCE_MOTION_FILES, resolve_motion_file
@@ -100,7 +91,7 @@ def _load_motion_npz(path):
         raise KeyError(f"{path} missing required fields: {missing}")
     if motion["dof_pos"].ndim != 2 or motion["dof_pos"].shape[1] != 29:
         raise ValueError(f"{path} dof_pos must be [T, 29], got {motion['dof_pos'].shape}")
-    print(f"[sim2sim_dance] loaded motion: {path} frames={motion['dof_pos'].shape[0]}", flush=True)
+    print(f"[sim2sim_dance_ser] loaded motion: {path} frames={motion['dof_pos'].shape[0]}", flush=True)
     return {key: np.asarray(value, dtype=np.float32) for key, value in motion.items()}
 
 
@@ -202,7 +193,7 @@ def _load_motion_csv(path):
         raise KeyError(f"{path} missing required CSV fields: {missing}")
     if motion["dof_pos"].ndim != 2 or motion["dof_pos"].shape[1] != 29:
         raise ValueError(f"{path} dof_pos must parse as [T, 29], got {motion['dof_pos'].shape}")
-    print(f"[sim2sim_dance] loaded CSV motion: {path} frames={motion['dof_pos'].shape[0]}", flush=True)
+    print(f"[sim2sim_dance_ser] loaded CSV motion: {path} frames={motion['dof_pos'].shape[0]}", flush=True)
     return motion
 
 
@@ -229,7 +220,7 @@ def _reference_feet_contact_from_motion(motion, idx, foot_contact_height_thresho
     if contact is None:
         if not getattr(_reference_feet_contact_from_motion, "_warned_missing_contact", False):
             print(
-                "[sim2sim_dance][WARN] motion has no feet_contact/ref_foot_contact/foot_height; "
+                "[sim2sim_dance_ser][WARN] motion has no feet_contact/ref_foot_contact/foot_height; "
                 "using zero reference contact in goal obs.",
                 flush=True,
             )
@@ -239,7 +230,7 @@ def _reference_feet_contact_from_motion(motion, idx, foot_contact_height_thresho
     contact = np.asarray(contact, dtype=np.float32).reshape(-1)[:2]
     contact = (contact > 0.5).astype(np.float32)
     if not getattr(_reference_feet_contact_from_motion, "_printed_source", False):
-        print(f"[sim2sim_dance] ref_feet_contact_source={source}, values are binarized 0/1", flush=True)
+        print(f"[sim2sim_dance_ser] ref_feet_contact_source={source}, values are binarized 0/1", flush=True)
         _reference_feet_contact_from_motion._printed_source = True
     return contact
 
@@ -295,6 +286,68 @@ def _action_scale_from_cfg(cfg):
     return scale
 
 
+def _build_serial_joint_indices(model, joint_names):
+    qpos_indices = []
+    qvel_indices = []
+    missing = []
+    for name in joint_names:
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if joint_id < 0:
+            missing.append(name)
+            continue
+        qpos_indices.append(int(model.jnt_qposadr[joint_id]))
+        qvel_indices.append(int(model.jnt_dofadr[joint_id]))
+    if missing:
+        raise RuntimeError(f"Serial XML missing joints from SERIAL_DOF_JOINT_NAMES: {missing}")
+    return np.asarray(qpos_indices, dtype=np.int64), np.asarray(qvel_indices, dtype=np.int64)
+
+
+def _read_serial_dof_state(data, qpos_indices, qvel_indices):
+    q = np.asarray(data.qpos[qpos_indices], dtype=np.float64).copy()
+    dq = np.asarray(data.qvel[qvel_indices], dtype=np.float64).copy()
+    return q, dq
+
+
+def _set_initial_serial_joint_state(model, data, qpos_indices, qvel_indices, initial_ref_dof):
+    if len(initial_ref_dof) != len(qpos_indices):
+        raise RuntimeError(
+            f"initial_ref_dof length {len(initial_ref_dof)} != serial joint count {len(qpos_indices)}"
+        )
+    data.qpos[qpos_indices] = initial_ref_dof
+    data.qvel[qvel_indices] = 0.0
+    mujoco.mj_forward(model, data)
+
+
+def _build_actuator_to_serial_dof_indices(model, joint_names):
+    name_to_serial_idx = {name: idx for idx, name in enumerate(joint_names)}
+    actuator_to_serial = np.full(model.nu, -1, dtype=np.int64)
+
+    for actuator_id in range(model.nu):
+        joint_id = int(model.actuator_trnid[actuator_id, 0])
+        if joint_id < 0:
+            continue
+        joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+        if joint_name in name_to_serial_idx:
+            actuator_to_serial[actuator_id] = name_to_serial_idx[joint_name]
+
+    missing = np.where(actuator_to_serial < 0)[0]
+    if len(missing) > 0:
+        if model.nu == len(joint_names):
+            actuator_to_serial = np.arange(model.nu, dtype=np.int64)
+            print(
+                "[sim2sim_dance_ser][WARN] actuator joint mapping incomplete; "
+                "fallback to actuator order == SERIAL_DOF_JOINT_NAMES order.",
+                flush=True,
+            )
+        else:
+            raise RuntimeError(
+                "Cannot map all actuators to serial joints. "
+                f"unmapped actuator ids={missing.tolist()}, model.nu={model.nu}, serial_dofs={len(joint_names)}"
+            )
+
+    return actuator_to_serial
+
+
 def _read_terminal_key():
     readable, _, _ = select.select([sys.stdin], [], [], 0.0)
     if not readable:
@@ -339,9 +392,176 @@ def _render_viewer(viewer, backend):
         viewer.render()
 
 
+def _debug_arrays(
+    time_buffer,
+    step_buffer,
+    ref_idx_buffer,
+    q_buffer,
+    dq_buffer,
+    ref_buffer,
+    final_target_buffer,
+    action_buffer,
+    tau_buffer,
+    foot_force_buffer,
+):
+    return {
+        "time": np.asarray(time_buffer, dtype=np.float64),
+        "lowlevel_step": np.asarray(step_buffer, dtype=np.int64),
+        "ref_idx": np.asarray(ref_idx_buffer, dtype=np.int64),
+        "q": np.asarray(q_buffer, dtype=np.float64),
+        "dq": np.asarray(dq_buffer, dtype=np.float64),
+        "ref": np.asarray(ref_buffer, dtype=np.float64),
+        "final_target": np.asarray(final_target_buffer, dtype=np.float64),
+        "action": np.asarray(action_buffer, dtype=np.float64),
+        "tau": np.asarray(tau_buffer, dtype=np.float64),
+        "foot_force": np.asarray(foot_force_buffer, dtype=np.float64),
+        "joint_names": np.asarray(SERIAL_DOF_JOINT_NAMES),
+    }
+
+
+def _save_debug_arrays(arrays, save_path):
+    save_path = Path(save_path).expanduser()
+    if not save_path.is_absolute():
+        save_path = _PROJECT_ROOT / save_path
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(save_path, **arrays)
+    print(f"[sim2sim_dance_ser] debug buffers saved: {save_path}", flush=True)
+    return save_path
+
+
+def _plot_lines(path, time_axis, series_list, title, ylabel, labels, show=False):
+    import matplotlib
+
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(len(series_list), 1, figsize=(14, 3.0 * len(series_list)), sharex=True)
+    if len(series_list) == 1:
+        axes = [axes]
+    for series_idx, (ax, (series, subtitle)) in enumerate(zip(axes, series_list)):
+        if labels and isinstance(labels[0], (list, tuple, np.ndarray)):
+            series_labels = labels[min(series_idx, len(labels) - 1)]
+        else:
+            series_labels = labels
+        for idx in range(series.shape[1]):
+            label = series_labels[idx] if idx < len(series_labels) else f"{idx}"
+            ax.plot(time_axis, series[:, idx], linewidth=0.9, label=label)
+        ax.set_title(subtitle)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", ncol=3, fontsize=8)
+    axes[-1].set_xlabel("time [s]")
+    fig.suptitle(title)
+    fig.tight_layout()
+    if path is not None:
+        fig.savefig(path, dpi=150)
+    if not show:
+        plt.close(fig)
+    return fig
+
+
+def _plot_debug_arrays(arrays, plot_dir="", show=False):
+    time_axis = arrays["time"]
+    if time_axis.size == 0:
+        print("[sim2sim_dance_ser][WARN] no debug samples to plot.", flush=True)
+        return None
+
+    q = arrays["q"]
+    dq = arrays["dq"]
+    ref = arrays["ref"]
+    final_target = arrays["final_target"]
+    action = arrays["action"]
+    tau = arrays["tau"]
+    foot_force = arrays["foot_force"]
+
+    left_idx = np.arange(0, 6)
+    right_idx = np.arange(6, 12)
+    leg_labels = list(SERIAL_DOF_JOINT_NAMES[:6])
+    right_labels = list(SERIAL_DOF_JOINT_NAMES[6:12])
+    leg_pair_labels = [leg_labels, leg_labels, leg_labels, right_labels, right_labels, right_labels]
+    plot_dir_path = None
+    if plot_dir:
+        plot_dir_path = Path(plot_dir).expanduser()
+        if not plot_dir_path.is_absolute():
+            plot_dir_path = _PROJECT_ROOT / plot_dir_path
+        plot_dir_path.mkdir(parents=True, exist_ok=True)
+
+    _plot_lines(
+        plot_dir_path / "leg_q_ref_target.png" if plot_dir_path is not None else None,
+        time_axis,
+        [
+            (q[:, left_idx], "left q"),
+            (ref[:, left_idx], "left ref"),
+            (final_target[:, left_idx], "left final target"),
+            (q[:, right_idx], "right q"),
+            (ref[:, right_idx], "right ref"),
+            (final_target[:, right_idx], "right final target"),
+        ],
+        "Serial Dance Joint Position / Reference / Target",
+        "rad",
+        leg_pair_labels,
+        show=show,
+    )
+    _plot_lines(
+        plot_dir_path / "leg_dq.png" if plot_dir_path is not None else None,
+        time_axis,
+        [(dq[:, left_idx], "left dq"), (dq[:, right_idx], "right dq")],
+        "Serial Dance Joint Velocity",
+        "rad/s",
+        [leg_labels, right_labels],
+        show=show,
+    )
+    _plot_lines(
+        plot_dir_path / "leg_tau.png" if plot_dir_path is not None else None,
+        time_axis,
+        [(tau[:, left_idx], "left tau"), (tau[:, right_idx], "right tau")],
+        "Serial Dance Joint Torque",
+        "Nm",
+        [leg_labels, right_labels],
+        show=show,
+    )
+    _plot_lines(
+        plot_dir_path / "leg_action.png" if plot_dir_path is not None else None,
+        time_axis,
+        [(action[:, left_idx], "left action"), (action[:, right_idx], "right action")],
+        "Serial Dance Full Action",
+        "action",
+        [leg_labels, right_labels],
+        show=show,
+    )
+    if foot_force.ndim == 2 and foot_force.shape[1] >= 6:
+        foot_labels = ["L_fx", "L_fy", "L_fz", "R_fx", "R_fy", "R_fz"]
+        foot_norm = np.stack(
+            [
+                np.linalg.norm(foot_force[:, 0:3], axis=1),
+                np.linalg.norm(foot_force[:, 3:6], axis=1),
+            ],
+            axis=1,
+        )
+        _plot_lines(
+            plot_dir_path / "foot_force.png" if plot_dir_path is not None else None,
+            time_axis,
+            [(foot_force[:, :6], "foot force xyz"), (foot_norm, "foot force norm")],
+            "Serial Dance Foot Force",
+            "N",
+            [foot_labels, ["L_norm", "R_norm"]],
+            show=show,
+        )
+
+    if plot_dir_path is not None:
+        print(f"[sim2sim_dance_ser] debug plots saved under: {plot_dir_path}", flush=True)
+    if show:
+        import matplotlib.pyplot as plt
+
+        print("[sim2sim_dance_ser] showing debug plot windows; close them to exit.", flush=True)
+        plt.show(block=True)
+    return plot_dir_path
+
+
 def run_mujoco(policy, cfg):
     if mujoco is None:
-        raise ImportError("mujoco is required for sim2sim_dance") from _MUJOCO_IMPORT_ERROR
+        raise ImportError("mujoco is required for sim2sim_dance_ser") from _MUJOCO_IMPORT_ERROR
 
     model = mujoco.MjModel.from_xml_path(cfg.sim_config.mujoco_model_path)
     model.opt.timestep = cfg.sim_config.dt
@@ -356,7 +576,7 @@ def run_mujoco(policy, cfg):
     mujoco.mj_forward(model, data)
     control_dt = cfg.sim_config.dt * cfg.sim_config.decimation
     print(
-        "[sim2sim_dance] timing: "
+        "[sim2sim_dance_ser] timing: "
         f"sim_dt={cfg.sim_config.dt:.6f}s ({1.0 / cfg.sim_config.dt:.1f}Hz), "
         f"control_dt={control_dt:.6f}s ({1.0 / control_dt:.1f}Hz), "
         f"decimation={cfg.sim_config.decimation}",
@@ -377,19 +597,19 @@ def run_mujoco(policy, cfg):
     }
     if viewer is not None:
         print(
-            f"[sim2sim_dance] viewer={viewer_backend}, render_interval={render_interval} low-level steps "
+            f"[sim2sim_dance_ser] viewer={viewer_backend}, render_interval={render_interval} low-level steps "
             f"({render_interval * cfg.sim_config.dt:.3f}s)",
             flush=True,
         )
     if not debug_record:
-        print("[sim2sim_dance] debug recording disabled; use --record_debug to save q/ref/action/force buffers.", flush=True)
+        print("[sim2sim_dance_ser] debug recording disabled; use --record_debug to save q/ref/action/force buffers.", flush=True)
     keyboard_fd = None
     keyboard_old_termios = None
     if sys.stdin.isatty():
         keyboard_fd = sys.stdin.fileno()
         keyboard_old_termios = termios.tcgetattr(keyboard_fd)
         tty.setcbreak(keyboard_fd)
-        print("[sim2sim_dance] 终端键盘控制：S 切换第一帧保持/恢复", flush=True)
+        print("[sim2sim_dance_ser] 终端键盘控制：S 切换第一帧保持/恢复", flush=True)
 
     def _restore_keyboard():
         if keyboard_old_termios is not None and keyboard_fd is not None:
@@ -414,12 +634,12 @@ def run_mujoco(policy, cfg):
     action_scale = _action_scale_from_cfg(cfg)
     foot_contact_height_threshold = float(getattr(cfg.motion, "foot_contact_height_threshold", 0.08))
 
-    fourbar = init_fourbar_params()
+    qpos_indices, qvel_indices = _build_serial_joint_indices(model, SERIAL_DOF_JOINT_NAMES)
+    actuator_to_serial = _build_actuator_to_serial_dof_indices(model, SERIAL_DOF_JOINT_NAMES)
     initial_ref_dof = motion["dof_pos"][0].astype(np.float64).copy()
-    initial_parallel = serial_to_parallel_pos_np(initial_ref_dof, fourbar)
-    set_initial_joint_state(model, data, initial_ref_dof, initial_parallel)
+    _set_initial_serial_joint_state(model, data, qpos_indices, qvel_indices, initial_ref_dof)
     mujoco.mj_forward(model, data)
-    print("[sim2sim_dance] 已按 reference 第一帧初始化 MuJoCo 关节角", flush=True)
+    print("[sim2sim_dance_ser] 已按 reference 第一帧初始化串联 XML 关节角", flush=True)
 
     action = np.zeros(cfg.env.num_actions, dtype=np.float64)
     last_action = np.zeros_like(action)
@@ -442,6 +662,7 @@ def run_mujoco(policy, cfg):
     initial_base_yaw = None
     ref_idx = 0
 
+    time_buffer, step_buffer, ref_idx_buffer = [], [], []
     tau_buffer, q_buffer, dq_buffer, ref_buffer = [], [], [], []
     final_target_buffer, action_buffer, foot_force_buffer = [], [], []
 
@@ -451,26 +672,29 @@ def run_mujoco(policy, cfg):
     )
     control_cycle_start = None
     control_cycle_index = 0
-    overrun_log_interval = max(1, int(getattr(cfg.sim_config, "overrun_log_interval", 1)))
-    iterator = tqdm(range(total_lowlevel_steps), desc="sim2sim_dance", mininterval=0.5, dynamic_ncols=True)
+    overrun_log_interval = max(1, int(getattr(cfg.sim_config, "overrun_log_interval", 50)))
+    if cfg.sim_config.real_time:
+        print(
+            "[sim2sim_dance_ser] real-time pacing enabled: "
+            f"each control cycle is padded to {control_dt:.6f}s ({1.0 / control_dt:.1f}Hz) when faster than target.",
+            flush=True,
+        )
+    iterator = tqdm(range(total_lowlevel_steps), desc="sim2sim_dance_ser", mininterval=0.5, dynamic_ncols=True)
     for count_lowlevel in iterator:
         step_start = time.perf_counter()
         if count_lowlevel % cfg.sim_config.decimation == 0:
             control_cycle_start = step_start
         if not _viewer_running(viewer, viewer_backend):
-            print("[sim2sim_dance] viewer closed, stopping simulation.", flush=True)
+            print("[sim2sim_dance_ser] viewer closed, stopping simulation.", flush=True)
             break
         if keyboard_fd is not None:
             key = _read_terminal_key()
             if key in ("s", "S"):
                 hold_first_frame = not hold_first_frame
-                print(f"[sim2sim_dance] hold_first_frame={hold_first_frame}", flush=True)
+                print(f"[sim2sim_dance_ser] hold_first_frame={hold_first_frame}", flush=True)
 
         t0 = time.perf_counter()
-        q_parallel = parallel_xml_to_policy_pos_np(np.asarray(data.actuator_length, dtype=np.float64))
-        dq_parallel = parallel_xml_to_policy_vel_np(np.asarray(data.actuator_velocity, dtype=np.float64))
-        q = parallel_to_serial_pos_np(q_parallel, fourbar)
-        dq = parallel_to_serial_vel_np(q, q_parallel, dq_parallel, fourbar)
+        q, dq = _read_serial_dof_state(data, qpos_indices, qvel_indices)
         profile["state"] += time.perf_counter() - t0
 
         if (not start_dance) and cfg.sim_config.static_com_log_interval > 0:
@@ -478,7 +702,7 @@ def run_mujoco(policy, cfg):
                 com_world = compute_world_com(model, data)
                 feet_mid = compute_body_midpoint(data, foot_body_ids)
                 waist_world = get_body_world_pos(data, waist_body_id)
-                msg = f"[sim2sim_dance][static] step={count_lowlevel} COM=({com_world[0]:.4f},{com_world[1]:.4f},{com_world[2]:.4f})"
+                msg = f"[sim2sim_dance_ser][static] step={count_lowlevel} COM=({com_world[0]:.4f},{com_world[1]:.4f},{com_world[2]:.4f})"
                 if feet_mid is not None:
                     msg += f" feet_mid=({feet_mid[0]:.4f},{feet_mid[1]:.4f},{feet_mid[2]:.4f})"
                 if waist_world is not None:
@@ -522,18 +746,18 @@ def run_mujoco(policy, cfg):
             policy_input = np.concatenate((obs.reshape(-1), goal_buf)).reshape(1, -1).astype(np.float32)
             if not getattr(cfg.sim_config, "_printed_obs_layout_warning", False):
                 print(
-                    "[sim2sim_dance] Dance goal obs includes feet_contact(2), 1=contact, 0=swing. "
+                    "[sim2sim_dance_ser] Dance goal obs includes feet_contact(2), 1=contact, 0=swing. "
                     "Old 73-dim checkpoints and normalizer statistics are incompatible. Train from scratch.",
                     flush=True,
                 )
                 print(
-                    "[sim2sim_dance] Observation layout changed: actor obs 73 -> 75. "
+                    "[sim2sim_dance_ser] Observation layout changed: actor obs 73 -> 75. "
                     "Old checkpoints and normalizer statistics are incompatible. "
                     "Train from scratch or reset normalizer.",
                     flush=True,
                 )
                 print(
-                    "[sim2sim_dance] observation shapes: "
+                    "[sim2sim_dance_ser] observation shapes: "
                     f"obs_now.shape={obs.shape}, goal_buf.shape={goal_buf.shape}, "
                     f"actor obs.shape={policy_input.shape}",
                     flush=True,
@@ -581,12 +805,13 @@ def run_mujoco(policy, cfg):
 
         tau_serial = pd_control(final_target, q, cfg.robot_config.kps, np.zeros_like(dq), dq, cfg.robot_config.kds)
         tau_serial = np.clip(tau_serial, -cfg.robot_config.tau_limit, cfg.robot_config.tau_limit)
-        tau_parallel = serial_tau_to_parallel_policy_tau_np(tau_serial, q, q_parallel, fourbar)
-        tau_xml = policy_parallel_to_xml_tau_np(tau_parallel)
-        data.ctrl[:] = tau_xml
+        data.ctrl[:] = tau_serial[actuator_to_serial]
         profile["control"] += time.perf_counter() - t_control
 
         if debug_record and count_lowlevel % debug_record_interval == 0:
+            time_buffer.append(count_lowlevel * cfg.sim_config.dt)
+            step_buffer.append(count_lowlevel)
+            ref_idx_buffer.append(ref_idx)
             tau_buffer.append(tau_serial.copy())
             q_buffer.append(q.copy())
             dq_buffer.append(dq.copy())
@@ -610,7 +835,7 @@ def run_mujoco(policy, cfg):
             _, _, quat, _, _, _ = get_obs(data)
             initial_base_yaw = R.from_quat(quat).as_euler("xyz")[2]
             print(
-                f"--- Start Dance Reference at low-level step {start_moving_step} "
+                f"[sim2sim_dance_ser] Start Dance Reference at low-level step {start_moving_step} "
                 f"({start_moving_step * cfg.sim_config.dt:.3f}s) ---",
                 flush=True,
             )
@@ -618,21 +843,21 @@ def run_mujoco(policy, cfg):
         if getattr(cfg.sim_config, "stop_on_fall", False):
             if float(data.qpos[2]) < float(getattr(cfg.sim_config, "fall_height", 0.35)):
                 print(
-                    f"[sim2sim_dance] stop_on_fall: base height={float(data.qpos[2]):.3f} "
+                    f"[sim2sim_dance_ser] stop_on_fall: base height={float(data.qpos[2]):.3f} "
                     f"at low-level step {count_lowlevel}",
                     flush=True,
                 )
                 break
 
         if cfg.sim_config.real_time and (count_lowlevel + 1) % cfg.sim_config.decimation == 0:
-            now = time.perf_counter()
-            cycle_elapsed = now - (control_cycle_start if control_cycle_start is not None else step_start)
+            cycle_start = control_cycle_start if control_cycle_start is not None else step_start
+            cycle_elapsed = time.perf_counter() - cycle_start
             sleep_time = control_dt - cycle_elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
             elif control_cycle_index % overrun_log_interval == 0:
                 print(
-                    "[sim2sim_dance][overrun] "
+                    "[sim2sim_dance_ser][overrun] "
                     f"control_cycle={control_cycle_index}, elapsed={cycle_elapsed * 1000.0:.3f}ms "
                     f"> target={control_dt * 1000.0:.3f}ms",
                     flush=True,
@@ -643,7 +868,7 @@ def run_mujoco(policy, cfg):
         if profile_interval > 0 and profile["count"] >= profile_interval:
             n = float(profile["count"])
             print(
-                "[sim2sim_dance profile] avg per low-level step: "
+                "[sim2sim_dance_ser profile] avg per low-level step: "
                 f"state={profile['state'] / n * 1000:.3f}ms, "
                 f"policy={profile['policy'] / n * 1000:.3f}ms, "
                 f"control={profile['control'] / n * 1000:.3f}ms, "
@@ -659,21 +884,46 @@ def run_mujoco(policy, cfg):
     if viewer is not None:
         viewer.close()
     if debug_record:
+        debug_arrays = _debug_arrays(
+            time_buffer,
+            step_buffer,
+            ref_idx_buffer,
+            q_buffer,
+            dq_buffer,
+            ref_buffer,
+            final_target_buffer,
+            action_buffer,
+            tau_buffer,
+            foot_force_buffer,
+        )
+        debug_save_path = getattr(cfg.sim_config, "debug_save_path", "")
+        if debug_save_path:
+            saved_path = _save_debug_arrays(debug_arrays, debug_save_path)
+        else:
+            saved_path = None
+        if bool(getattr(cfg.sim_config, "plot_debug", False)):
+            plot_dir = getattr(cfg.sim_config, "debug_plot_dir", "")
+            _plot_debug_arrays(debug_arrays, plot_dir=plot_dir, show=True)
         print(
-            "[sim2sim_dance] finished. "
+            "[sim2sim_dance_ser] finished. "
             f"q={np.asarray(q_buffer).shape}, ref={np.asarray(ref_buffer).shape}, "
+            f"target={np.asarray(final_target_buffer).shape}, tau={np.asarray(tau_buffer).shape}, "
             f"action={np.asarray(action_buffer).shape}, foot_force={np.asarray(foot_force_buffer).shape}",
             flush=True,
         )
     else:
-        print("[sim2sim_dance] finished.", flush=True)
+        print("[sim2sim_dance_ser] finished.", flush=True)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="MRobot dance sim2sim in MuJoCo.")
+    parser = argparse.ArgumentParser(description="MRobot serial-ankle dance sim2sim in MuJoCo.")
     parser.add_argument("--load_model", type=str, required=True, help="Path to .pt JIT or .onnx policy.")
     parser.add_argument("--motion_file", type=str, default=DEFAULT_DANCE_MOTION_FILES[0], help="Dance *_keypoint.npz or *_keypoint.csv path.")
-    parser.add_argument("--terrain", action="store_true", help="Use terrain MuJoCo xml instead of plane.")
+    parser.add_argument(
+        "--terrain",
+        action="store_true",
+        help="Reserved for a future serial terrain XML. Currently raises NotImplementedError.",
+    )
     parser.add_argument("--duration", type=float, default=195.0)
     parser.add_argument("--sim_dt", type=float, default=0.002, help="Low-level MuJoCo timestep. Default 0.002s = 500Hz.")
     parser.add_argument("--control_dt", type=float, default=0.02, help="Policy/control period. Default 0.02s = 50Hz.")
@@ -701,6 +951,23 @@ def parse_args():
         default=10,
         help="Record debug buffers every N low-level steps when --record_debug is enabled.",
     )
+    parser.add_argument(
+        "--debug_save_path",
+        type=str,
+        default="",
+        help="Optional output .npz path for debug buffers. Empty means do not save.",
+    )
+    parser.add_argument(
+        "--plot_debug",
+        action="store_true",
+        help="Show q/ref/target/dq/tau/action/foot-force plots at the end. Implies --record_debug.",
+    )
+    parser.add_argument(
+        "--debug_plot_dir",
+        type=str,
+        default="",
+        help="Optional directory to also save --plot_debug PNG files. Empty means show only.",
+    )
     parser.add_argument("--static_com_log_interval", type=int, default=0, help="0 disables static COM logging.")
     parser.add_argument("--solver_iterations", type=int, default=None, help="Optional MuJoCo solver iterations override.")
     parser.add_argument("--solver_ls_iterations", type=int, default=None, help="Optional MuJoCo line-search iterations override.")
@@ -708,8 +975,8 @@ def parse_args():
     parser.add_argument(
         "--overrun_log_interval",
         type=int,
-        default=1,
-        help="When real-time pacing is enabled, print every N control-cycle overruns. Default 1 prints every overrun.",
+        default=50,
+        help="When real-time pacing is enabled, print every N control-cycle overruns. Default 50 avoids log spam.",
     )
     parser.add_argument("--stop_on_fall", action="store_true", help="Stop rollout once base height is below --fall_height.")
     parser.add_argument("--fall_height", type=float, default=0.35, help="Base-height threshold used by --stop_on_fall.")
@@ -736,12 +1003,11 @@ if __name__ == "__main__":
 
         class sim_config:
             if args.terrain:
-                mujoco_model_path = f"{LEGGED_GYM_ROOT_DIR}/resources/robots/Mrobot/mjcf/mjmodel_terrain.xml"
-            else:
-                mujoco_model_path = (
-                    f"{LEGGED_GYM_ROOT_DIR}/resources/robots/CASBOT02_ENCOS_7dof_shell_20251015/"
-                    "Serial/xml/CASBOT_02_shell_ENCOS_7dof_par_bass.xml"
-                )
+                raise NotImplementedError("Serial terrain XML is not provided yet.")
+            mujoco_model_path = (
+                f"{LEGGED_GYM_ROOT_DIR}/resources/robots/CASBOT02_ENCOS_7dof_shell_20251015/"
+                "Serial/xml/CASBOT_02_shell_ENCOS_7dof.xml"
+            )
             motion_file = args.motion_file
             sim_duration = args.duration
             dt = args.sim_dt
@@ -755,8 +1021,11 @@ if __name__ == "__main__":
             viewer = args.viewer
             headless = args.headless
             viewer_render_interval = args.viewer_render_interval
-            record_debug = args.record_debug
+            record_debug = args.record_debug or args.plot_debug
             debug_record_interval = args.debug_record_interval
+            debug_save_path = args.debug_save_path
+            plot_debug = args.plot_debug
+            debug_plot_dir = args.debug_plot_dir
             solver_iterations = args.solver_iterations
             solver_ls_iterations = args.solver_ls_iterations
             profile_interval = args.profile_interval
@@ -806,18 +1075,18 @@ if __name__ == "__main__":
             )
             tau_limit = np.array(
                 [
-                    66.7,
+                    74.4,
                     86.7,
-                    60.1,
+                    55.9,
+                    74.4,
+                    41.5,
+                    41.5,
+                    74.4,
                     86.7,
-                    31.5,
-                    31.5,
-                    66.7,
-                    86.7,
-                    60.1,
-                    86.7,
-                    31.5,
-                    31.5,
+                    55.9,
+                    74.4,
+                    41.5,
+                    41.5,
                     *([35.2] * 17),
                 ],
                 dtype=np.float64,

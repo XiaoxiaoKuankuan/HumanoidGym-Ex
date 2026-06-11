@@ -167,13 +167,16 @@ TASK_LAYOUT_NOTES = {
     ),
     "mrobot_dance": (
         "Dance actor obs = 75 = 42 proprio(q/default_q/dq/action/base/euler) "
-        "+ 33 goal(ref_dof_pos/ref_dof_vel/waist/ref_feet_contact)"
+        "+ 33 goal(ref_dof_pos/ref_dof_vel/waist/feet_contact)"
     ),
 }
 
 OLD_LAYOUT_NOTES = {
     "mrobot_music": "旧 BPM checkpoint 通常是 actor obs 64、critic obs 210。",
-    "mrobot_dance": "旧 Dance checkpoint 通常是 actor obs 61 或 73、critic obs 210 或 222；当前为 actor obs 75、critic obs 197。",
+    "mrobot_dance": (
+        "旧 Dance checkpoint 通常是 actor obs 61 或 73；当前为 actor obs 75、critic obs 197。"
+        "Dance goal includes feet_contact(2), 1=contact, 0=swing."
+    ),
 }
 
 # 观测维度

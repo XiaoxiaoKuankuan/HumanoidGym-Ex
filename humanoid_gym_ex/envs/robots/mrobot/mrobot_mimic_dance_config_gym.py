@@ -62,6 +62,8 @@ class MrobotMimicDanceGymCfg(MrobotMimicCommonCfg):
 
     class control(MrobotMimicCommonCfg.control):
         action_scale = 0.25
+        ankle_action_scale = 0.2
+        ankle_action_scale_indices = [4, 5, 10, 11]
         use_ref_residual_target = True
         # 50Hz trajectory reference with sim.dt=0.005s -> 4 physics steps per policy step.
         # The Gym/Lab envs still recompute this when match_reference_fps=True.
@@ -76,6 +78,10 @@ class MrobotMimicDanceGymCfg(MrobotMimicCommonCfg):
         tracking_termination_grace_steps = 5
 
     class rewards(MrobotMimicCommonCfg.rewards):
+        # Only hide duplicate weighted tracking reward components from episode
+        # logs. Reward computation is unchanged; raw tracking quality is logged
+        # as score_*.
+        hide_tracking_reward_logs = True
         dof_err_w = [
             1.0,
             1.0,

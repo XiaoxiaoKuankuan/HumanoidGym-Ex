@@ -54,6 +54,7 @@ class MrobotMimicCommonEnv(LeggedRobot):
     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
         self._pre_legged_robot_init(cfg, sim_params)
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
+        self.action_scale_tensor = self._build_action_scale_tensor()
         self.last_feet_z = 0.05
         self.feet_height = torch.zeros((self.num_envs, 2), device=self.device)
         self.num_aux = self.cfg.env.num_aux
@@ -119,6 +120,22 @@ class MrobotMimicCommonEnv(LeggedRobot):
     def _post_task_reference_init(self):
         """Hook for task-specific diagnostics after common body mappings exist."""
 
+    def _build_action_scale_tensor(self):
+        raw_scale = getattr(self.cfg.control, "action_scale", 1.0)
+        if isinstance(raw_scale, (list, tuple, np.ndarray)):
+            scale = torch.as_tensor(raw_scale, device=self.device, dtype=torch.float32)
+            if scale.numel() != self.num_actions:
+                raise ValueError(f"control.action_scale length must be {self.num_actions}, got {scale.numel()}")
+            scale = scale.clone()
+        else:
+            scale = torch.full((self.num_actions,), float(raw_scale), device=self.device, dtype=torch.float32)
+
+        ankle_scale = getattr(self.cfg.control, "ankle_action_scale", None)
+        if ankle_scale is not None:
+            ankle_indices = getattr(self.cfg.control, "ankle_action_scale_indices", [4, 5, 10, 11])
+            scale[torch.as_tensor(ankle_indices, device=self.device, dtype=torch.long)] = float(ankle_scale)
+        return scale
+
     def compute_ref_state(self):
         raise NotImplementedError
 
@@ -127,6 +144,9 @@ class MrobotMimicCommonEnv(LeggedRobot):
 
     def _get_privileged_reference_phase_obs(self, norm_phase):
         return torch.zeros_like(norm_phase)
+
+    def _get_privileged_ref_feet_contact_obs(self):
+        return 1.0 - self.ref_feet_contact
 
     def _get_reference_norm_phase(self):
         return torch.zeros(self.num_envs, 1, device=self.device)
@@ -525,7 +545,7 @@ class MrobotMimicCommonEnv(LeggedRobot):
             [torch.Tensor]: Torques sent to the simulation
         """
         # pd controller
-        actions_scaled = actions * self.cfg.control.action_scale
+        actions_scaled = actions * self.action_scale_tensor
         p_gains = self.p_gains * self.Kp_factors
         d_gains = self.d_gains * self.Kd_factors
         dof_vel_for_pd = self._get_ankle_dq_for_pd()
@@ -678,8 +698,7 @@ class MrobotMimicCommonEnv(LeggedRobot):
         ), dim=-1)   # [N, 45]
         dif_root_linvel = (self.base_lin_vel - self.ref_root_linvel) * self.obs_scales.lin_vel
         dif_root_angvel = (self.base_ang_vel - self.ref_root_angvel) * self.obs_scales.ang_vel
-        # 参考脚抬脚状态（1=抬脚，0=不抬脚），仅特权观测。feet_contact_buffer 存接触掩码(1=触地)，取反得抬脚
-        ref_foot_contact_curr = 1.0 - self.ref_feet_contact
+        ref_foot_contact_curr = self._get_privileged_ref_feet_contact_obs()
         
         priv_curr_dim = int(
             getattr(self.cfg.env, "num_privileged_obs", 45 + 146 + 31)
@@ -706,7 +725,7 @@ class MrobotMimicCommonEnv(LeggedRobot):
                 (self.Kd_factors[:, self.num_control] - self.cfg.domain_rand.kd_range[0]) / (self.cfg.domain_rand.kd_range[1] - self.cfg.domain_rand.kd_range[0]), # 12
                 (self.payload - self.cfg.domain_rand.payload_mass_range[0]) / (self.cfg.domain_rand.payload_mass_range[1] - self.cfg.domain_rand.payload_mass_range[0]), # 1
                 self.com_displacement * self.obs_scales.com_pos, # 3
-                ref_foot_contact_curr,  # 2：左/右脚参考抬脚（1=抬脚，0=不抬脚）
+                ref_foot_contact_curr,  # 2：任务定义的参考脚底接触观测
                 self._get_privileged_reference_phase_obs(norm_phase), # 1
             ), dim=-1)
         else:
@@ -736,7 +755,7 @@ class MrobotMimicCommonEnv(LeggedRobot):
                 (self.Kd_factors[:, self.num_control] - self.cfg.domain_rand.kd_range[0]) / (self.cfg.domain_rand.kd_range[1] - self.cfg.domain_rand.kd_range[0]), # 12
                 (self.payload - self.cfg.domain_rand.payload_mass_range[0]) / (self.cfg.domain_rand.payload_mass_range[1] - self.cfg.domain_rand.payload_mass_range[0]), # 1
                 self.com_displacement * self.obs_scales.com_pos, # 3
-                ref_foot_contact_curr,  # 2：左/右脚参考抬脚（1=抬脚，0=不抬脚）
+                ref_foot_contact_curr,  # 2：任务定义的参考脚底接触观测
                 self._get_privileged_reference_phase_obs(norm_phase), # 1
             ), dim=-1)  # 146
         if priv_obs_curr_part.shape[1] != priv_curr_dim:
@@ -1173,10 +1192,14 @@ class MrobotMimicCommonEnv(LeggedRobot):
         self.reset_buf[env_ids] = 1
 
         self.extras["episode"] = {}
+        hidden_reward_logs = set()
+        if bool(getattr(self.cfg.rewards, "hide_tracking_reward_logs", False)) and hasattr(self, "tracking_score_sums"):
+            hidden_reward_logs = set(self.tracking_score_sums.keys())
         for key in self.episode_sums.keys():
-            self.extras["episode"]['rew_' + key] = torch.mean(
-                self.episode_sums[key][env_ids] / (self.episode_length_buf[env_ids] + 1.)
-            )
+            if key not in hidden_reward_logs:
+                self.extras["episode"]['rew_' + key] = torch.mean(
+                    self.episode_sums[key][env_ids] / (self.episode_length_buf[env_ids] + 1.)
+                )
             self.episode_sums[key][env_ids] = 0.
         if hasattr(self, "tracking_score_sums"):
             for key in self.tracking_score_sums.keys():

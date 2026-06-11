@@ -857,8 +857,8 @@ class MrobotMimicCommonCfg(LeggedRobotCfg):
             # ankle_roll_dof_vel = -1e-3   # 只惩罚左右 ankle roll 速度，优先压制内外侧支撑抖动
             # action_smoothness = -0.02
             dof_pos_limits = -3.
-            torque_limits = -2
-            ankle_torque_limit = -3 # 惩罚踝关节力矩超限
+            torque_limits = 0.0
+            ankle_torque_limit = 0.0 # implicit actuator control does not use old manual torque penalties
             # feet_contact_forces = -0.02 # -0.01  -5e-3
             # torques = -1e-6  # -1e-5
             # penalty_stumble = -1 

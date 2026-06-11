@@ -179,6 +179,9 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
     def _get_privileged_reference_phase_obs(self, norm_phase):
         return torch.zeros_like(norm_phase)
 
+    def _get_privileged_ref_feet_contact_obs(self):
+        return self.ref_feet_contact.float()
+
     def _advance_reference_phase(self):
         max_phase = self.demo_lengths[self.ref_idx].clamp(min=1) - 1
         self.phase_idx[:] = torch.minimum(self.phase_idx + 1, max_phase)
@@ -186,7 +189,8 @@ class MrobotMimicDanceEnv(MrobotMimicCommonEnv):
     def _get_noncontrolled_ref_actions(self):
         self.compute_ref_state()
         ref_pos = self.ref_dof_pos[:, self.ref_num_notcontrol]
-        return ref_pos / self.cfg.control.action_scale
+        scale = self.action_scale_tensor[self.ref_num_notcontrol].clamp(min=1e-6)
+        return ref_pos / scale
 
     def _sample_reference_reset_state(self, env_ids):
         if self.cfg.domain_rand.RSI:

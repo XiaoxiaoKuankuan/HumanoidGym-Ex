@@ -5,6 +5,7 @@ import os
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
@@ -24,6 +25,14 @@ from humanoid_gym_ex.envs.robots.mrobot.mrobot_mimic_dance_config_lab import Mro
 from humanoid_gym_ex.utils.mrobot_trajectory_reference import get_motion_files_from_cfg, load_mrobot_trajectory_library
 from humanoid_gym_ex.utils.reference_state import JOINT_NAME_ALIASES, ReferenceStateNet
 
+
+def _make_contact_sensor_cfg(**kwargs):
+    """Create a ContactSensorCfg while tolerating older IsaacLab signatures."""
+    try:
+        return ContactSensorCfg(**kwargs)
+    except TypeError:
+        kwargs.pop("force_threshold", None)
+        return ContactSensorCfg(**kwargs)
 
 
 def _quat_wxyz_to_xyzw(quat):
@@ -250,8 +259,9 @@ class MrobotMimicBPMIsaacLabEnvCfg(MrobotMimicIsaacLabBaseEnvCfg):
                 joint_names_expr=[".*"],
                 effort_limit_sim=MrobotMimicBPMLabCfg.lab_joint_effort_limits,
                 velocity_limit_sim=MrobotMimicBPMLabCfg.lab_joint_velocity_limits,
-                stiffness=0.0,
-                damping=0.0,
+                stiffness=MrobotMimicBPMLabCfg.control.stiffness,
+                damping=MrobotMimicBPMLabCfg.control.damping,
+                armature=getattr(MrobotMimicBPMLabCfg.control, "armature", None),
             )
         },
     )
@@ -336,16 +346,18 @@ class MrobotMimicDanceIsaacLabEnvCfg(MrobotMimicIsaacLabBaseEnvCfg):
                 joint_names_expr=[".*"],
                 effort_limit_sim=MrobotMimicDanceLabCfg.lab_joint_effort_limits,
                 velocity_limit_sim=MrobotMimicDanceLabCfg.lab_joint_velocity_limits,
-                stiffness=0.0,
-                damping=0.0,
+                stiffness=MrobotMimicDanceLabCfg.control.stiffness,
+                damping=MrobotMimicDanceLabCfg.control.damping,
+                armature=getattr(MrobotMimicDanceLabCfg.control, "armature", None),
             )
         },
     )
-    contact_sensor: ContactSensorCfg = ContactSensorCfg(
+    contact_sensor: ContactSensorCfg = _make_contact_sensor_cfg(
         prim_path="/World/envs/env_.*/Robot/.*(base_link|waist_yaw_link|pelvic_yaw_link|knee_pitch_link|ankle_roll_link)",
-        history_length=1,
+        history_length=3,
         update_period=MrobotMimicDanceLabCfg.sim.dt * decimation,
-        track_air_time=False,
+        track_air_time=True,
+        force_threshold=10.0,
     )
 
 
@@ -377,12 +389,13 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
             self.mrobot_cfg.domain_rand.randomize_joint_armature = False
             self.mrobot_cfg.domain_rand.action_delay = False
         super().__init__(cfg, render_mode, **kwargs)
-        self.backend = IsaacLabBackend(self, self.robot, self.contact_sensor)
+        self.backend = IsaacLabBackend(self, self.robot, self.contact_sensor, effort_control=False)
         self.num_policy_actions = self.cfg.action_space
         self.num_actions = self.cfg.action_space
         self.num_obs = self.cfg.observation_space
         self.num_privileged_obs = self.cfg.state_space
         self._init_buffers()
+        self.action_scale_tensor = self._build_action_scale_tensor()
         self._init_task_reference_runtime()
         self._prepare_reward_function()
         self.update_domain_rand_curriculum(0, force=True)
@@ -394,6 +407,23 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
     def _profile_sync(self):
         if "cuda" in str(self.device) and torch.cuda.is_available():
             torch.cuda.synchronize()
+
+    def _build_action_scale_tensor(self):
+        raw_scale = getattr(self.mrobot_cfg.control, "action_scale", getattr(self.cfg, "action_scale", 1.0))
+        full_num_actions = int(getattr(self.mrobot_cfg.env, "num_actions", 29))
+        if isinstance(raw_scale, (list, tuple, np.ndarray)):
+            scale = torch.as_tensor(raw_scale, device=self.device, dtype=torch.float32)
+            if scale.numel() != full_num_actions:
+                raise ValueError(f"control.action_scale length must be {full_num_actions}, got {scale.numel()}")
+            scale = scale.clone()
+        else:
+            scale = torch.full((full_num_actions,), float(raw_scale), device=self.device, dtype=torch.float32)
+
+        ankle_scale = getattr(self.mrobot_cfg.control, "ankle_action_scale", None)
+        if ankle_scale is not None:
+            ankle_indices = getattr(self.mrobot_cfg.control, "ankle_action_scale_indices", [4, 5, 10, 11])
+            scale[torch.as_tensor(ankle_indices, device=self.device, dtype=torch.long)] = float(ankle_scale)
+        return scale
 
     def _profile_record(self, accum, name, seconds):
         if accum is not None:
@@ -616,6 +646,106 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
             f"state_space={self.cfg.state_space}, device={self.device}",
             flush=True,
         )
+        if self.reference_label == "trajectory":
+            print(
+                "[HumanoidGym-Ex] Dance goal obs includes feet_contact(2), 1=contact, 0=swing. "
+                "Old checkpoints and normalizer statistics with 73-dim actor obs are incompatible. Train from scratch.",
+                flush=True,
+            )
+            print(
+                "[HumanoidGym-Ex] MRobot Dance actor q observation uses q - default_q. "
+                "Old Dance checkpoints/normalizers from raw-q or q-ref-q observations are incompatible.",
+                flush=True,
+            )
+            print(
+                "[HumanoidGym-Ex] MRobot Dance motion files: "
+                + ", ".join([str(path) for path in getattr(self, "motion_files", [])]),
+                flush=True,
+            )
+            reference_fps = float(getattr(self.mrobot_cfg.motion, "reference_fps", 0.0))
+            expected_reference_dt = 1.0 / reference_fps if reference_fps > 0.0 else float("nan")
+            num_steps_per_env = getattr(self.cfg, "num_steps_per_env", None)
+            physics_substeps = None if num_steps_per_env is None else int(num_steps_per_env) * int(self.cfg.decimation)
+            print(
+                "[HumanoidGym-Ex] MRobot Dance timing: "
+                f"sim.dt={self.cfg.sim.dt}, control.decimation={self.cfg.decimation}, "
+                f"policy_dt={self.step_dt:.6f}, reference_fps={reference_fps:g}, "
+                f"expected_reference_dt={expected_reference_dt:.6f}, "
+                f"physics_substeps_per_rollout={physics_substeps}, "
+                f"max_episode_length_steps={self.max_episode_length}",
+                flush=True,
+            )
+        else:
+            print(
+                "[HumanoidGym-Ex] Observation layout changed: actor obs 64 -> 76. "
+                "Old checkpoints and normalizer statistics are incompatible. "
+                "Train from scratch or reset normalizer.",
+                flush=True,
+            )
+        solver_pos = getattr(self.mrobot_cfg.sim.physx, "num_position_iterations", None)
+        solver_vel = getattr(self.mrobot_cfg.sim.physx, "num_velocity_iterations", None)
+        print(
+            "[HumanoidGym-Ex] MRobot IsaacLab control diagnostics: "
+            "control_mode = implicit_position_target, "
+            f"use_ref_residual_target = {bool(getattr(self.mrobot_cfg.control, 'use_ref_residual_target', False))}, "
+            f"sim_dt = {self.cfg.sim.dt}, decimation = {self.cfg.decimation}, policy_dt = {self.step_dt:.6f}, "
+            f"PhysX solver pos/vel iters = {solver_pos}/{solver_vel}",
+            flush=True,
+        )
+        if self.reference_label == "trajectory":
+            contact_cfg = getattr(self.cfg, "contact_sensor", None)
+            torque_scale = getattr(self.mrobot_cfg.rewards.scales, "torque_limits", None)
+            ankle_torque_scale = getattr(self.mrobot_cfg.rewards.scales, "ankle_torque_limit", None)
+            print(
+                "[HumanoidGym-Ex] MRobot Dance control/obs changes: "
+                f"dance goal dim = {self.mrobot_cfg.env.num_goal_obs}, "
+                "feet_contact included in actor/critic observations, "
+                f"action_scale_default = {float(self.action_scale_tensor[0].item()):.3f}, "
+                f"ankle_action_scale[{getattr(self.mrobot_cfg.control, 'ankle_action_scale_indices', [4, 5, 10, 11])}] = "
+                f"{float(getattr(self.mrobot_cfg.control, 'ankle_action_scale', self.action_scale_tensor[4].item())):.3f}, "
+                f"torque_limits reward disabled = {float(torque_scale or 0.0) == 0.0}, "
+                f"ankle_torque_limit reward disabled = {float(ankle_torque_scale or 0.0) == 0.0}, "
+                f"contact_sensor history_length = {getattr(contact_cfg, 'history_length', None)}, "
+                f"track_air_time = {getattr(contact_cfg, 'track_air_time', None)}",
+                flush=True,
+            )
+        print(
+            "[HumanoidGym-Ex] MRobot body mapping: "
+            f"base={self._body_names_from_indices(self.base_indices)}, "
+            f"waist={self._body_names_from_indices(self.waist_indices)}, "
+            f"feet={self._body_names_from_indices(self.feet_indices)}, "
+            f"knee={self._body_names_from_indices(self.knee_indices)}, "
+            f"hip={self._body_names_from_indices(self.hip_indices)}, "
+            f"pelvic_yaw={self._body_names_from_indices(self.pelvic_yaw_indices)}",
+            flush=True,
+        )
+        print(
+            "[HumanoidGym-Ex] MRobot action preprocessing: "
+            f"actions_filter={bool(getattr(self.mrobot_cfg.normalization, 'actions_filter', False))}, "
+            f"action_delay={bool(getattr(self.mrobot_cfg.domain_rand, 'action_delay', False))}, "
+            f"action_delay_range={getattr(self.mrobot_cfg.domain_rand, 'action_delay_range', None)}, "
+            f"current_delay_ratio={float(getattr(self, '_current_delay_ratio', 0.0))}",
+            flush=True,
+        )
+        print(
+            "[HumanoidGym-Ex] MRobot tracking mapping: "
+            f"anchor_body={self._body_names_from_indices(torch.as_tensor([self.waist_body_id], device=self.device))}, "
+            f"tracking_body_count={len(self.all_tracking_indices)}, "
+            f"tracking_body_names={self._body_names_from_indices(self.all_tracking_indices)}, "
+            f"tracking_body_indices={self.all_tracking_indices.detach().cpu().tolist()}",
+            flush=True,
+        )
+        sensor_body_names = list(getattr(self.contact_sensor, "body_names", []) or [])
+        print(
+            "[HumanoidGym-Ex] MRobot contact mapping: "
+            f"termination_robot={self._body_names_from_indices(self.termination_robot_indices)}, "
+            f"penalized_robot={self._body_names_from_indices(self.penalized_robot_indices)}, "
+            f"termination_sensor_indices={self.termination_contact_indices.detach().cpu().tolist()}, "
+            f"penalized_sensor_indices={self.penalised_contact_indices.detach().cpu().tolist()}, "
+            f"feet_sensor_indices={self.feet_contact_indices.detach().cpu().tolist()}, "
+            f"sensor_bodies={sensor_body_names}",
+            flush=True,
+        )
 
     def _init_task_reference_runtime(self):
         self._init_reference_network()
@@ -632,6 +762,20 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
 
     def _write_task_episode_infos(self, episode_info):
         pass
+
+    def _include_ref_feet_contact_in_privileged_obs(self):
+        return True
+
+    def _get_privileged_ref_feet_contact_obs(self):
+        return 1.0 - self.ref_feet_contact
+
+    def _print_observation_layout_notice(self):
+        print(
+            "[HumanoidGym-Ex] Observation layout changed: actor obs 64 -> 76. "
+            "Old checkpoints and normalizer statistics are incompatible. "
+            "Train from scratch or reset normalizer.",
+            flush=True,
+        )
 
     def _resample_reference_state(self, env_ids):
         motion = self.mrobot_cfg.motion
@@ -679,81 +823,6 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
         self.waist_ori_bad_buf[:] = False
         self.foot_z_bad_buf[:] = False
         self.tracking_error_reset_buf[:] = False
-        if source == "trajectory":
-            print(
-                "[HumanoidGym-Ex] Observation layout changed: Dance actor obs 61/73 -> 75, "
-                "critic obs 210/222 -> 197. "
-                "Old checkpoints and normalizer statistics are incompatible. "
-                "Train from scratch or reset normalizer.",
-                flush=True,
-            )
-            print(
-                "[HumanoidGym-Ex] MRobot Dance actor q observation uses q - default_q. "
-                "Old Dance checkpoints/normalizers from raw-q or q-ref-q observations are incompatible.",
-                flush=True,
-            )
-            print(
-                "[HumanoidGym-Ex] MRobot Dance motion files: "
-                + ", ".join([str(path) for path in getattr(self, "motion_files", [])]),
-                flush=True,
-            )
-            reference_fps = float(getattr(self.mrobot_cfg.motion, "reference_fps", 0.0))
-            expected_reference_dt = 1.0 / reference_fps if reference_fps > 0.0 else float("nan")
-            num_steps_per_env = getattr(self.cfg, "num_steps_per_env", None)
-            physics_substeps = None if num_steps_per_env is None else int(num_steps_per_env) * int(self.cfg.decimation)
-            print(
-                "[HumanoidGym-Ex] MRobot Dance timing: "
-                f"sim.dt={self.cfg.sim.dt}, control.decimation={self.cfg.decimation}, "
-                f"policy_dt={self.step_dt:.6f}, reference_fps={reference_fps:g}, "
-                f"expected_reference_dt={expected_reference_dt:.6f}, "
-                f"physics_substeps_per_rollout={physics_substeps}, "
-                f"max_episode_length_steps={self.max_episode_length}",
-                flush=True,
-            )
-        else:
-            print(
-                "[HumanoidGym-Ex] Observation layout changed: actor obs 64 -> 76. "
-                "Old checkpoints and normalizer statistics are incompatible. "
-                "Train from scratch or reset normalizer.",
-                flush=True,
-            )
-        print(
-            "[HumanoidGym-Ex] MRobot body mapping: "
-            f"base={self._body_names_from_indices(self.base_indices)}, "
-            f"waist={self._body_names_from_indices(self.waist_indices)}, "
-            f"feet={self._body_names_from_indices(self.feet_indices)}, "
-            f"knee={self._body_names_from_indices(self.knee_indices)}, "
-            f"hip={self._body_names_from_indices(self.hip_indices)}, "
-            f"pelvic_yaw={self._body_names_from_indices(self.pelvic_yaw_indices)}",
-            flush=True,
-        )
-        print(
-            "[HumanoidGym-Ex] MRobot action preprocessing: "
-            f"actions_filter={bool(getattr(self.mrobot_cfg.normalization, 'actions_filter', False))}, "
-            f"action_delay={bool(getattr(self.mrobot_cfg.domain_rand, 'action_delay', False))}, "
-            f"action_delay_range={getattr(self.mrobot_cfg.domain_rand, 'action_delay_range', None)}, "
-            f"current_delay_ratio={float(getattr(self, '_current_delay_ratio', 0.0))}",
-            flush=True,
-        )
-        print(
-            "[HumanoidGym-Ex] MRobot tracking mapping: "
-            f"anchor_body={self._body_names_from_indices(torch.as_tensor([self.waist_body_id], device=self.device))}, "
-            f"tracking_body_count={len(self.all_tracking_indices)}, "
-            f"tracking_body_names={self._body_names_from_indices(self.all_tracking_indices)}, "
-            f"tracking_body_indices={self.all_tracking_indices.detach().cpu().tolist()}",
-            flush=True,
-        )
-        sensor_body_names = list(getattr(self.contact_sensor, "body_names", []) or [])
-        print(
-            "[HumanoidGym-Ex] MRobot contact mapping: "
-            f"termination_robot={self._body_names_from_indices(self.termination_robot_indices)}, "
-            f"penalized_robot={self._body_names_from_indices(self.penalized_robot_indices)}, "
-            f"termination_sensor_indices={self.termination_contact_indices.detach().cpu().tolist()}, "
-            f"penalized_sensor_indices={self.penalised_contact_indices.detach().cpu().tolist()}, "
-            f"feet_sensor_indices={self.feet_contact_indices.detach().cpu().tolist()}, "
-            f"sensor_bodies={sensor_body_names}",
-            flush=True,
-        )
 
     def _body_index_from_name(self, name, default=0):
         ids, _ = self.robot.find_bodies(name)
@@ -1010,6 +1079,7 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
         self.last_full_actions = torch.zeros_like(self.full_actions)
         self.delayed_full_actions_scaled = torch.zeros_like(self.full_actions)
         self.target_dof_pos = torch.zeros_like(self.full_actions)
+        self.sim_order_position_targets = torch.zeros(self.num_envs, self.robot.num_joints, device=self.device)
         self.sim_order_torques = torch.zeros(self.num_envs, self.robot.num_joints, device=self.device)
         self.actions = torch.zeros(self.num_envs, self.num_policy_actions, device=self.device)
         self.env_ids_arange = torch.arange(self.num_envs, device=self.device)
@@ -2424,7 +2494,10 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
         self.full_actions.zero_()
         self.full_actions[:, self.num_control] = actions
         profile_start = self._profile_section_start()
-        self.full_actions[:, self.num_notcontrol] = self.ref_dof_pos[:, self.ref_num_notcontrol] / self.cfg.action_scale
+        self.full_actions[:, self.num_notcontrol] = (
+            self.ref_dof_pos[:, self.ref_num_notcontrol]
+            / self.action_scale_tensor[self.ref_num_notcontrol].clamp(min=1e-6)
+        )
         self._profile_section_end("noncontrolled_ref_action", profile_start)
         self._apply_substep = 0
 
@@ -2439,7 +2512,7 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
             full_actions = (1.0 - rate) * self.last_full_actions + rate * self.full_actions
         else:
             full_actions = self.full_actions
-        scaled = full_actions * self.cfg.action_scale
+        scaled = full_actions * self.action_scale_tensor
         self._profile_section_end("action_filter", profile_start)
         profile_start = self._profile_section_start()
         if self.action_delay_buffer is not None and getattr(self.mrobot_cfg.domain_rand, "action_delay", False):
@@ -2454,33 +2527,20 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
         self.delayed_full_actions_scaled[:] = scaled
         target = self.target_dof_pos
         target.copy_(self.ref_dof_pos)
-        if getattr(self.mrobot_cfg.control, "use_ref_residual_target", False):
+        if bool(getattr(self.mrobot_cfg.control, "use_ref_residual_target", False)):
             target[:, self.num_control] = self.ref_dof_pos[:, self.num_control] + scaled[:, self.num_control]
         else:
-            default_dof_pos_with_offset = self.default_dof_pos + self.default_dof_pos_offsets
-            target[:, self.num_control] = default_dof_pos_with_offset[:, self.num_control] + scaled[:, self.num_control]
-        target.add_(self.motor_offsets)
-        dof_vel_for_pd = self._get_ankle_dq_for_pd()
-        torques = self.Kp_factors * self.p_gains * (target - self.dof_pos) - self.Kd_factors * self.d_gains * dof_vel_for_pd
-        torques = torques * self.motor_strength_factors
-        self.torques = torch.clip(torques, -self.torque_limits, self.torque_limits)
-        if getattr(self.mrobot_cfg.domain_rand, "use_coulomb", False):
-            left = (
-                self.mrobot_cfg.domain_rand.left_Us
-                * torch.tanh(self.dof_vel[:, [4, 5]] / self.mrobot_cfg.domain_rand.left_Qs)
-                + self.mrobot_cfg.domain_rand.left_Ud * self.dof_vel[:, [4, 5]]
-            )
-            right = (
-                self.mrobot_cfg.domain_rand.right_Us
-                * torch.tanh(self.dof_vel[:, [10, 11]] / self.mrobot_cfg.domain_rand.right_Qs)
-                + self.mrobot_cfg.domain_rand.right_Ud * self.dof_vel[:, [10, 11]]
-            )
-            self.torques[:, [4, 5]] -= left
-            self.torques[:, [10, 11]] -= right
-            self.torques = torch.clip(self.torques, -self.torque_limits, self.torque_limits)
-        self.sim_order_torques.zero_()
-        self.sim_order_torques[:, self.joint_sim_ids] = self.torques
-        self.backend.set_dof_targets(self.sim_order_torques)
+            target[:, self.num_control] = self.default_dof_pos[:, self.num_control] + scaled[:, self.num_control]
+        self.sim_order_position_targets[:] = self.robot.data.default_joint_pos
+        self.sim_order_position_targets[:, self.joint_sim_ids] = target
+        self.robot.set_joint_position_target(self.sim_order_position_targets)
+        applied_torque = getattr(self.robot.data, "applied_torque", None)
+        if applied_torque is not None:
+            self.sim_order_torques[:] = applied_torque
+            self.torques[:] = applied_torque[:, self.joint_sim_ids]
+        else:
+            self.sim_order_torques.zero_()
+            self.torques.zero_()
         self._apply_substep += 1
 
     def _get_observations(self):
@@ -2597,8 +2657,9 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
         cursor += 1
         priv_curr[:, cursor : cursor + 3] = self.com_displacement * self.obs_scales.com_pos
         cursor += 3
-        priv_curr[:, cursor : cursor + 2] = 1.0 - self.ref_feet_contact
-        cursor += 2
+        if self._include_ref_feet_contact_in_privileged_obs():
+            priv_curr[:, cursor : cursor + 2] = self._get_privileged_ref_feet_contact_obs()
+            cursor += 2
         priv_curr[:, cursor : cursor + 1] = self._get_privileged_reference_phase_obs()
         cursor += 1
         if cursor != self.priv_curr_dim:
@@ -2607,13 +2668,7 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
         self.privileged_obs_buf[:, 45 : 45 + self.priv_curr_dim] = priv_curr
         self.privileged_obs_buf[:, 45 + self.priv_curr_dim :] = goal_buf
         if not getattr(self, "_printed_observation_layout_shapes", False):
-            print(
-                "[HumanoidGym-Ex] Observation layout changed: Dance actor obs 61/73 -> 75 "
-                "or BPM actor obs 64 -> 76. "
-                "Old checkpoints and normalizer statistics are incompatible. "
-                "Train from scratch or reset normalizer.",
-                flush=True,
-            )
+            self._print_observation_layout_notice()
             print(
                 "[HumanoidGym-Ex] MRobot IsaacLab observation shapes: "
                 f"obs_now.shape={tuple(obs_now.shape)}, goal_buf.shape={tuple(goal_buf.shape)}, "
@@ -2825,8 +2880,14 @@ class MrobotMimicIsaacLabBaseEnv(DirectRLEnv):
                 self._adaptive_curriculum_length_sum += torch.sum(episode_lengths)
                 self._adaptive_curriculum_fall_sum += torch.sum(self.fall_reset_buf[env_ids].float())
                 self._adaptive_curriculum_pending_resets += int(len(env_ids))
+            hidden_reward_logs = set()
+            if bool(getattr(self.mrobot_cfg.rewards, "hide_tracking_reward_logs", False)) and hasattr(
+                self, "tracking_score_sums"
+            ):
+                hidden_reward_logs = set(self.tracking_score_sums.keys())
             for name in self.episode_sums:
-                self.extras["episode"]["rew_" + name] = torch.mean(self.episode_sums[name][env_ids] / denom)
+                if name not in hidden_reward_logs:
+                    self.extras["episode"]["rew_" + name] = torch.mean(self.episode_sums[name][env_ids] / denom)
                 self.episode_sums[name][env_ids] = 0.0
             if hasattr(self, "tracking_score_sums"):
                 for name in self.tracking_score_sums:
@@ -3107,6 +3168,26 @@ class MrobotMimicDanceIsaacLabEnv(MrobotMimicIsaacLabBaseEnv):
         episode_info["sampling_entropy"] = self.motion_sampling_entropy
         episode_info["sampling_top1_prob"] = self.motion_sampling_top1_prob
         episode_info["sampling_top1_bin"] = self.motion_sampling_top1_bin
+
+    def _include_ref_feet_contact_in_privileged_obs(self):
+        return True
+
+    def _get_privileged_ref_feet_contact_obs(self):
+        return self.ref_feet_contact.float()
+
+    def _print_observation_layout_notice(self):
+        print(
+            "[HumanoidGym-Ex] Dance goal obs includes feet_contact(2), 1=contact, 0=swing. "
+            "Old checkpoints and normalizer statistics with 73-dim actor obs are incompatible. Train from scratch.",
+            flush=True,
+        )
+        print(
+            "[HumanoidGym-Ex] Observation layout changed: Dance actor obs 73 -> 75, "
+            "critic obs 193 -> 197. "
+            "Old checkpoints and normalizer statistics are incompatible. "
+            "Train from scratch or reset normalizer.",
+            flush=True,
+        )
 
     def _resample_reference_state(self, env_ids):
         if getattr(self.mrobot_cfg.domain_rand, "RSI", 1):
